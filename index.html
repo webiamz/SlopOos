@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Telegram Slot Automation</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="mark">SO</div>
+          <div>
+            <strong>SlotOps</strong>
+            <span>Python Telethon Bot</span>
+          </div>
+        </div>
+        <a href="#overview">Overview</a>
+        <a href="#rules">Rules</a>
+        <a href="#accounts">Accounts</a>
+        <a href="#groups">Groups</a>
+        <a href="#logs">Logs</a>
+        <p class="safe">Only use accounts the client owns or has explicit permission to operate. No ban bypass, captcha bypass, or restriction evasion.</p>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <h1>Telegram Slot Automation</h1>
+            <p>Monitor approved groups, detect slot messages, and run a controlled repeat cycle.</p>
+          </div>
+          <button id="toggle" class="primary">Start</button>
+        </header>
+
+        <section id="overview" class="metrics">
+          <article><span>Automation</span><strong id="automation">Paused</strong></article>
+          <article><span>Accounts</span><strong id="accountCount">0</strong></article>
+          <article><span>Groups</span><strong id="groupCount">0</strong></article>
+          <article><span>Cycle</span><strong id="cycle">12h</strong></article>
+        </section>
+
+        <section id="rules" class="panel">
+          <h2>Automation Rules</h2>
+          <div class="grid">
+            <label>Cycle hours<input id="cycleHours" type="number" min="1" max="72" /></label>
+            <label>Delay seconds<input id="delay" type="number" min="3" max="120" /></label>
+            <label>Action<select id="action"><option value="log_only">Log only</option><option value="send_message">Send message</option></select></label>
+            <label>Keywords<input id="keywords" /></label>
+          </div>
+          <label>Response message<textarea id="responseMessage" rows="3"></textarea></label>
+          <div class="actions">
+            <button id="saveRules" class="secondary">Save rules</button>
+            <button id="demo" class="ghost">Create demo detection</button>
+          </div>
+        </section>
+
+        <div class="columns">
+          <section id="accounts" class="panel">
+            <h2>Accounts</h2>
+            <form id="accountForm" class="form">
+              <input id="accountLabel" placeholder="Account label" required />
+              <input id="sessionString" placeholder="Telethon session string" required />
+              <button class="primary">Add account</button>
+            </form>
+            <div id="accountsList" class="rows"></div>
+          </section>
+
+          <section id="groups" class="panel">
+            <h2>Groups</h2>
+            <form id="groupForm" class="form">
+              <input id="groupTitle" placeholder="Display title" required />
+              <input id="groupIdentifier" placeholder="@group, https://t.me/..., or chat ID" required />
+              <button class="primary">Add group</button>
+            </form>
+            <div id="groupsList" class="rows"></div>
+          </section>
+        </div>
+
+        <section id="logs" class="panel">
+          <h2>Detections & Logs</h2>
+          <div class="hint">
+            Client flow: open Telegram bot, send /start, then /admin. Use buttons for Accounts, Groups, Assign Account, Start, Pause, and Settings.
+          </div>
+          <div class="columns">
+            <div><h3>Detections</h3><div id="detections" class="timeline"></div></div>
+            <div><h3>System Logs</h3><div id="systemLogs" class="timeline"></div></div>
+          </div>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
