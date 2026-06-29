@@ -24,6 +24,13 @@ STATIC_DIR = ROOT / "static"
 store = build_store()
 app = FastAPI(title="Telegram Slot Automation Bot")
 
+@app.get("/")
+async def root():
+    return {"status": "online"}
+
+
+
+
 api_id = int(os.getenv("TELEGRAM_API_ID", "0") or "0")
 api_hash = os.getenv("TELEGRAM_API_HASH", "")
 worker_enabled = os.getenv("WORKER_ENABLED", "true").lower() == "true"
