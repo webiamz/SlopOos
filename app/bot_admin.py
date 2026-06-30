@@ -271,20 +271,37 @@ class AdminBot:
             CustomDB.set(f"shift_{chat_id}", args.strip())
             await self.reply(chat_id, f"👁️ <b>Impersonation Active:</b> You are now managing Admin <code>{args}</code>'s accounts.", main_keyboard())
 
-    async def server_status(self, chat_id: int) -> None:
+            async def server_status(self, chat_id: int) -> None:
+        import os
+        import time
         uptime_sec = int(time.time() - START_TIME)
         h, rem = divmod(uptime_sec, 3600)
         m, s = divmod(rem, 60)
+        
+        ram_usage = "Unknown"
+        try:
+            free = os.popen('free -m').readlines()
+            if len(free) > 1:
+                ram_info = free[1].split()
+                total_ram = ram_info[1]
+                used_ram = ram_info[2]
+                ram_percent = int((float(used_ram) / float(total_ram)) * 100)
+                ram_usage = f"{ram_percent}% ({used_ram}MB / {total_ram}MB)"
+        except Exception:
+            ram_usage = "Not available"
         
         text = (
             "🖥️ <b>Server Status</b> 🖥️\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             f"⏱️ <b>Uptime:</b> <code>{h}h {m}m {s}s</code>\n"
+            f"🧠 <b>RAM Usage:</b> <code>{ram_usage}</code>\n"
             f"⚡ <b>Active Tasks:</b> <code>{len(self.active_tasks)}</code>\n"
             f"👤 <b>Your Accounts:</b> <code>{len(self.get_visible_accounts(chat_id))}</code>\n"
-            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "━━━━━━━━━━━━━━━━━━━━━━"
         )
         await self.reply(chat_id, text)
+
+
 
     async def handle_ref_link(self, chat_id: int, link: str) -> None:
         try:
