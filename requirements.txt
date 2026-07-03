@@ -1,6 +1,6 @@
 fastapi==0.124.4
 uvicorn[standard]==0.38.0
-telethon==1.42.0
+git+https://github.com/LonamiWebs/Telethon.git
 python-dotenv==1.2.1
 pydantic==2.12.5
 pymongo[srv]>=4.7,<5
