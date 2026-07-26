@@ -33,7 +33,7 @@ class KeepAliveHandler(BaseHTTPRequestHandler):
 
 def run_keep_alive():
     try:
-        server = HTTPServer(('0.0.0.0', 8080), KeepAliveHandler)
+        server = HTTPServer(('0.0.0.0', 8081), KeepAliveHandler)
         server.serve_forever()
     except Exception:
         pass
