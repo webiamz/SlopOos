@@ -27,7 +27,6 @@ START_TIME = time.time()
 REFER_STATE = {}
 MESSAGE_STATE = {}
 
-# 🔥 AESTHETIC EMOJIS BUILDER 🔥
 def ce(char, eid): return f'<tg-emoji emoji_id="{eid}">{char}</tg-emoji>'
 E_USER = ce("👤", "5258362837411045098")
 E_GRP = ce("📂", "5258514780469075716")
@@ -40,6 +39,7 @@ E_AI = ce("🤖", "5258093637450866522")
 E_SEC = ce("🔒", "5258476306152038031")
 E_SET = ce("⚙️", "5258096772776991776")
 E_HELP = ce("ℹ️", "5258503720928288433")
+E_INFO = ce("ℹ️", "5258503720928288433")
 E_TIME = ce("⏲", "5258258882022612173")
 
 class CustomDB:
@@ -56,7 +56,7 @@ class CustomDB:
             return None
         if cls.collection is None:
             try:
-                cls.client = MongoClient(cls.MONGO_URI, serverSelectionTimeoutMS=5000)
+                cls.client = MongoClient(cls.MONGO_URI, serverSelectionTimeoutMS=3000)
                 cls.db = cls.client["SlotOpsDB"]
                 cls.collection = cls.db["bot_data"]
             except Exception:
@@ -116,17 +116,17 @@ class AdminBot:
         self.sync_admin_ids()
 
     def set_bot_menu(self):
-        commands = [
-            {"command": "start", "description": "Open Admin Panel"},
-            {"command": "mass_refer", "description": "Start Mass Referral task"},
-            {"command": "claim", "description": "Mass claim to assigned groups"},
-            {"command": "message", "description": "Auto-send msg from random accounts"},
-            {"command": "random", "description": "Randomize slot schedules"},
-            {"command": "status", "description": "Check Server RAM & Uptime"},
-            {"command": "help", "description": "Show commands guide"}
-        ]
-        data = {"commands": commands}
         try:
+            commands = [
+                {"command": "start", "description": "Open Admin Panel"},
+                {"command": "mass_refer", "description": "Start Mass Referral task"},
+                {"command": "claim", "description": "Mass claim to assigned groups"},
+                {"command": "message", "description": "Auto-send msg from random accounts"},
+                {"command": "random", "description": "Randomize slot schedules"},
+                {"command": "status", "description": "Check Server RAM & Uptime"},
+                {"command": "help", "description": "Show commands guide"}
+            ]
+            data = {"commands": commands}
             req = urllib.request.Request(f"https://api.telegram.org/bot{self.notifier.bot_token}/setMyCommands", data=json.dumps(data).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
             urllib.request.urlopen(req, timeout=5)
         except Exception:
@@ -135,17 +135,17 @@ class AdminBot:
     def get_visible_accounts(self, chat_id: int) -> list[dict[str, Any]]:
         all_accounts = self.store.accounts()
         master_owner = list(self.owner_admin_ids)[0] if self.owner_admin_ids else 0
-        
+
         view_state = CustomDB.get(f"shift_{chat_id}", str(chat_id))
         visible_accs = []
-        
+
         for acc in all_accounts:
             acc_owner = str(CustomDB.get(f"owner_{acc['id']}", master_owner))
             if view_state.lower() == "all":
                 visible_accs.append(acc)
             elif acc_owner == str(view_state):
                 visible_accs.append(acc)
-                
+
         return visible_accs
 
     def get_help_text(self) -> str:
@@ -176,8 +176,9 @@ class AdminBot:
             return
         if not self.notifier.enabled:
             return
-        
-        self.set_bot_menu() 
+
+        # Non-blocking menu setup
+        threading.Thread(target=self.set_bot_menu, daemon=True).start()
         self.task = asyncio.create_task(self._poll_loop())
 
     async def stop(self) -> None:
@@ -185,7 +186,11 @@ class AdminBot:
             self.task.cancel()
 
     async def _poll_loop(self) -> None:
-        await self.drop_pending_updates()
+        try:
+            await self.drop_pending_updates()
+        except Exception:
+            pass
+
         while True:
             try:
                 updates = await self.get_updates()
@@ -193,9 +198,7 @@ class AdminBot:
                     self.offset = max(self.offset, int(update["update_id"]) + 1)
                     asyncio.create_task(self.handle_update(update))
             except Exception as exc:
-                if "timed out" not in str(exc).lower():
-                    await self.notify_admin_error(exc)
-                await asyncio.sleep(5)
+                await asyncio.sleep(3)
 
     async def drop_pending_updates(self) -> None:
         try:
@@ -223,9 +226,9 @@ class AdminBot:
         chat_id = int((message.get("chat") or {}).get("id", 0))
         text = (message.get("text") or "").strip()
         if not text or not self.is_admin(chat_id): return
-        
+
         asyncio.create_task(self.handle_command(chat_id, text))
-    
+
     def _build_stats(self, chat_id: int) -> str:
         today = datetime.now(timezone.utc)
         today_str = today.strftime("%Y-%m-%d")
@@ -282,7 +285,7 @@ class AdminBot:
         for day in range(1, 31):
             current_rate += (slope * (0.85 ** day))
             current_rate = max(current_rate, active_profits[-1] * 0.5)
-            
+
             if day <= 7:
                 week_pred += current_rate
             month_pred += current_rate
@@ -296,7 +299,7 @@ class AdminBot:
             f"🔮 1 Month Forecast: <code>{int(month_pred):,} Extols</code>\n\n"
             "<i>(Modeled via Weighted Regression Math)</i>"
         )
-        
+
     def _build_menu(self, chat_id: int) -> str:
         settings = self.store.settings()
         my_accs = len(self.get_visible_accounts(chat_id))
@@ -326,7 +329,7 @@ class AdminBot:
         if not self.is_admin(chat_id):
             await self.answer_callback(query_id, "Unauthorized")
             return
-        
+
         asyncio.create_task(self.answer_callback(query_id))
 
         try:
@@ -396,7 +399,7 @@ class AdminBot:
             elif data == "pause_auto":
                 self.store.update_settings({"automation_enabled": False})
                 await self.reply(chat_id, f"{E_ERR} Automation paused.", main_keyboard(), message_id=message_id)
-                
+
             elif data == "toggle_airdrop":
                 current = CustomDB.get("airdrop_enabled", False)
                 CustomDB.set("airdrop_enabled", not current)
@@ -409,11 +412,11 @@ class AdminBot:
             elif data == "admins": 
                 text = await asyncio.to_thread(self.render_admins, chat_id)
                 await self.reply(chat_id, text, admins_keyboard(), message_id=message_id)
-            
+
             elif data == "security_help":
                 msg = f"{E_SEC} <b>Security System</b>\n\nNew logins are monitored interactively. If a new device connects, you will receive an alert here with buttons to Approve or Kick the session."
                 await self.reply(chat_id, msg, back_keyboard(), message_id=message_id)
-                
+
             elif data.startswith("kick_"):
                 parts = data.split("_")
                 if len(parts) == 3:
