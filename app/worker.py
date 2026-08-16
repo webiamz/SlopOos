@@ -170,6 +170,7 @@ class TelegramWorker:
         self._membership_check_at: dict[str, float] = {}
         self._membership_retry_after: dict[str, float] = {}
         self._security_seen: dict[str, float] = {}
+        self._security_poll_at: dict[str, float] = {}
 
     async def start(self) -> None:
         if self.task and not self.task.done():
@@ -307,6 +308,12 @@ class TelegramWorker:
                 if not client.is_connected():
                     self.store.patch_account(account["id"], {"status": "offline"})
                 
+                # IMPORTANT: Telegram does not guarantee that updateNewAuthorization
+                # reaches this Telethon connection when the user is actively using
+                # another Telegram client. Poll the authoritative authorization list
+                # as a second detection path.
+                await self.poll_security_sessions(account, self.clients[account["id"]])
+
                 if automation_enabled and assigned_groups:
                     await self.run_due_schedules(account, self.clients[account["id"]], settings)
                     await self.check_group_memberships(account, self.clients[account["id"]])
@@ -382,13 +389,147 @@ class TelegramWorker:
             )
             await self.notify_admins(f"{E_ERR} <b>Account Error!</b>\n{E_USER} Label: <code>{account['label']}</code>\n{E_WARN} Error: {error}")
 
-    def attach_security_handler(self, client: TelegramClient, account: dict[str, Any]) -> None:
-        """Watch Telegram's native new-session update for this user account.
+    async def poll_security_sessions(self, account: dict[str, Any], client: TelegramClient) -> None:
+        """Reliably detect newly-created Telegram sessions.
 
-        Telegram sends updateNewAuthorization to other active sessions when a
-        new login occurs. We keep the exact authorization hash so the admin can
-        terminate only that session; the worker's current session is never
-        targeted.
+        Telegram's updateNewAuthorization is a fast path, not a reliable
+        monitoring mechanism for a worker connection: Telegram may deliver
+        updates to another active connection of the same account. Therefore we
+        periodically query account.getAuthorizations and diff authorization
+        hashes. The first successful poll establishes a baseline so existing
+        sessions do not create false alerts after a worker restart/deploy.
+        """
+        account_id = str(account["id"])
+        now = time.time()
+        if now - self._security_poll_at.get(account_id, 0.0) < 15:
+            return
+        self._security_poll_at[account_id] = now
+
+        try:
+            auths = await client(GetAuthorizationsRequest())
+            authorizations = list(getattr(auths, "authorizations", []) or [])
+
+            current_hashes: set[int] = set()
+            for auth in authorizations:
+                try:
+                    h = int(getattr(auth, "hash", 0) or 0)
+                except Exception:
+                    h = 0
+                if h:
+                    current_hashes.add(h)
+
+            if not current_hashes:
+                return
+
+            db_key = f"security_known_hashes_{account_id}"
+            raw_known = CustomDB.get(db_key, None)
+            if not isinstance(raw_known, list):
+                # Establish a baseline on first run. Do not spam alerts for
+                # sessions that already existed before monitoring started.
+                CustomDB.set(db_key, sorted(current_hashes))
+                return
+
+            known_hashes = set()
+            for value in raw_known:
+                try:
+                    known_hashes.add(int(value))
+                except Exception:
+                    pass
+
+            new_hashes = current_hashes - known_hashes
+            # Persist the snapshot before notifying so repeated polls/restarts
+            # cannot generate duplicate alerts for the same authorization.
+            CustomDB.set(db_key, sorted(current_hashes))
+
+            for target in authorizations:
+                try:
+                    auth_hash = int(getattr(target, "hash", 0) or 0)
+                except Exception:
+                    auth_hash = 0
+                if not auth_hash or auth_hash not in new_hashes:
+                    continue
+                # Never create a destructive action for the worker's own
+                # authorization. Telegram marks the worker session as current.
+                if bool(getattr(target, "current", False)):
+                    continue
+
+                await self.queue_security_alert(
+                    account,
+                    target,
+                    source_date=int(getattr(target, "date_created", 0) or now),
+                )
+        except Exception as exc:
+            self.store.log(
+                "error",
+                "Security authorization poll failed",
+                {"account_id": account_id, "error": str(exc)},
+            )
+
+    async def queue_security_alert(
+        self,
+        account: dict[str, Any],
+        target: Any,
+        source_date: int | None = None,
+        update: Any = None,
+    ) -> None:
+        """Create one admin security alert for an exact Telegram authorization."""
+        try:
+            auth_hash = int(getattr(target, "hash", 0) or 0)
+            if not auth_hash or bool(getattr(target, "current", False)):
+                return
+
+            key = f"{account['id']}:{auth_hash}"
+            now = time.time()
+            if now - self._security_seen.get(key, 0) < 30:
+                return
+            self._security_seen[key] = now
+
+            token = uuid.uuid4().hex
+            pending = {
+                "token": token,
+                "account_id": account["id"],
+                "account_label": account["label"],
+                "hash": auth_hash,
+                "date": int(
+                    (getattr(update, "date", 0) if update is not None else 0)
+                    or source_date
+                    or now
+                ),
+                "device": (
+                    getattr(update, "device", None) if update is not None else None
+                ) or getattr(target, "device_model", "Unknown"),
+                "location": (
+                    getattr(update, "location", None) if update is not None else None
+                ) or getattr(target, "country", "Unknown"),
+                "ip": getattr(target, "ip", "Unknown"),
+                "platform": getattr(target, "platform", "Unknown"),
+            }
+
+            CustomDB.set(f"security_pending_token_{token}", pending)
+            markup = {
+                "inline_keyboard": [[
+                    {"text": "Logout", "callback_data": f"security_logout:{token}", "icon_custom_emoji_id": "5176972756180271693"},
+                    {"text": "It's Me", "callback_data": f"security_confirm:{token}", "icon_custom_emoji_id": "5206607081334906820"},
+                ]]
+            }
+            msg = (
+                f"{E_SEC} <b>NEW LOGIN DETECTED</b>\n"
+                f"{E_USER} Account: <code>{account['label']}</code>\n"
+                f"{E_NET} IP: <code>{pending['ip']}</code>\n"
+                f"{E_PHONE} Device: <code>{pending['device']}</code>\n"
+                f"{E_LOC} Location: <code>{pending['location']}</code>\n"
+                f"{E_INFO} Platform: <code>{pending['platform']}</code>\n\n"
+                f"<i>This is the exact new session reported by Telegram.</i>"
+            )
+            await self.notify_admins(msg, reply_markup=markup)
+        except Exception as exc:
+            self.store.log("error", "Security alert creation failed", {"error": str(exc)})
+
+    def attach_security_handler(self, client: TelegramClient, account: dict[str, Any]) -> None:
+        """Fast-path handler for Telegram's native new-session update.
+
+        The authoritative polling path is still required because Telegram may
+        route updates to another active connection of the same account.
         """
         @client.on(events.Raw(UpdateNewAuthorization))
         async def security_handler(update: UpdateNewAuthorization) -> None:
@@ -397,55 +538,38 @@ class TelegramWorker:
                 if not auth_hash:
                     return
 
-                key = f"{account['id']}:{auth_hash}"
-                now = time.time()
-                if now - self._security_seen.get(key, 0) < 30:
-                    return
-                self._security_seen[key] = now
-
-                # Verify the session exists and is NOT this worker's current
-                # authorization before presenting a destructive action.
                 auths = await client(GetAuthorizationsRequest())
                 target = next(
                     (a for a in auths.authorizations
-                     if int(getattr(a, "hash", 0)) == auth_hash),
+                     if int(getattr(a, "hash", 0) or 0) == auth_hash),
                     None,
                 )
                 if target is None or getattr(target, "current", False):
                     return
 
-                token = uuid.uuid4().hex
-                pending = {
-                    "token": token,
-                    "account_id": account["id"],
-                    "account_label": account["label"],
-                    "hash": auth_hash,
-                    "date": int(getattr(update, "date", 0) or time.time()),
-                    "device": getattr(update, "device", None) or getattr(target, "device_model", "Unknown"),
-                    "location": getattr(update, "location", None) or getattr(target, "country", "Unknown"),
-                    "ip": getattr(target, "ip", "Unknown"),
-                    "platform": getattr(target, "platform", "Unknown"),
-                }
-                # Opaque callback token: do not expose account IDs/session hashes in Telegram callback data.
-                CustomDB.set(f"security_pending_token_{token}", pending)
+                # Mark it known so the poller will not send a second alert.
+                known_key = f"security_known_hashes_{account['id']}"
+                raw_known = CustomDB.get(known_key, [])
+                known = set()
+                if isinstance(raw_known, list):
+                    for value in raw_known:
+                        try:
+                            known.add(int(value))
+                        except Exception:
+                            pass
+                known.add(auth_hash)
+                # Include all currently visible authorizations so the baseline
+                # remains complete after an event-driven detection.
+                for auth in auths.authorizations:
+                    try:
+                        h = int(getattr(auth, "hash", 0) or 0)
+                        if h:
+                            known.add(h)
+                    except Exception:
+                        pass
+                CustomDB.set(known_key, sorted(known))
 
-                callback_base = token
-                markup = {
-                    "inline_keyboard": [[
-                        {"text": "Logout", "callback_data": f"security_logout:{callback_base}", "icon_custom_emoji_id": "5176972756180271693"},
-                        {"text": "It's Me", "callback_data": f"security_confirm:{callback_base}", "icon_custom_emoji_id": "5206607081334906820"},
-                    ]]
-                }
-                msg = (
-                    f"{E_SEC} <b>NEW LOGIN DETECTED</b>\n"
-                    f"{E_USER} Account: <code>{account['label']}</code>\n"
-                    f"{E_NET} IP: <code>{pending['ip']}</code>\n"
-                    f"{E_PHONE} Device: <code>{pending['device']}</code>\n"
-                    f"{E_LOC} Location: <code>{pending['location']}</code>\n"
-                    f"{E_INFO} Platform: <code>{pending['platform']}</code>\n\n"
-                    f"<i>This is the exact new session reported by Telegram.</i>"
-                )
-                await self.notify_admins(msg, reply_markup=markup)
+                await self.queue_security_alert(account, target, update=update)
             except Exception as exc:
                 self.store.log("error", "Security login handler failed", {"error": str(exc)})
 
