@@ -34,7 +34,7 @@ ARMAN_ID = 7998217405
 # 🔥 AESTHETIC PREMIUM EMOJIS 🔥
 # Kurigram/Pyrogram HTML parser <emoji id="..."> use karta hai, Bot-API wala <tg-emoji emoji_id="..."> NAHI
 # TEST karne ke liye False rakho (plain emoji dikhega, notifications guaranteed jayenge).
-PREMIUM_EMOJI_ENABLED = False
+PREMIUM_EMOJI_ENABLED = True
 def ce(char, eid):
     return f'<emoji id="{eid}">{char}</emoji>' if PREMIUM_EMOJI_ENABLED else char
 E_USER = ce("👤", "5258362837411045098")
