@@ -34,7 +34,7 @@ MESSAGE_STATE = {}
 # Kurigram/Pyrogram HTML parser <emoji id="..."> use karta hai, Bot-API wala <tg-emoji emoji_id="..."> NAHI
 # TEST karne ke liye False rakho (plain emoji dikhega, panel guaranteed chalega).
 # Jab confirm ho jaye ki reply aa raha hai, tab True karke premium emoji try karo.
-PREMIUM_EMOJI_ENABLED = False
+PREMIUM_EMOJI_ENABLED = True
 def ce(char, eid):
     return f'<emoji id="{eid}">{char}</emoji>' if PREMIUM_EMOJI_ENABLED else char
 E_USER = ce("👤", "5258362837411045098")
