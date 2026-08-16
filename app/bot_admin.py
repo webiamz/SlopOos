@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 from typing import Any
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pymongo import MongoClient
 
 #  KURIGRAM (PYROGRAM) ENGINE 
@@ -26,6 +27,7 @@ from app.notifier import BotNotifier
 from app.store import Store
 
 START_TIME = time.time()
+IST = ZoneInfo("Asia/Kolkata")
 REFER_STATE = {}
 MESSAGE_STATE = {}
 
@@ -41,7 +43,8 @@ def ce(char: str, eid: str) -> str:
     return f'<emoji id="{eid}">{char}</emoji>' if PREMIUM_EMOJI_ENABLED else ""
 
 # Premium emoji map: Telemojies 2 + News Emoji packs supplied by the user.
-E_USER   = ce("\U0001F464", "6057728771719435723")
+ACCOUNT_EMOJI_ID = "6057728771719435723"
+E_USER   = ce("\U0001F464", ACCOUNT_EMOJI_ID)
 E_GRP    = ce("\U0001F4C2", "5177109606723223979")
 E_CHK    = ce("\u2714\uFE0F", "5206607081334906820")
 E_ERR    = ce("\u274C", "5176972756180271693")
@@ -75,6 +78,10 @@ E_CHEVRON= ce("\U0001F51D", "5415655814079723871")
 E_MOM_UP = ce("🔼", "5449683594425410231")
 E_MOM_DOWN = ce("🔽", "5447183459602669338")
 E_MOM_STABLE = ce("➡️", "5416117059207572332")
+E_HEALTH = ce("🛡", "5251203410396458957")
+E_FIRST = ce("🥇", "6064442557222360271")
+E_SECOND = ce("🥈", "6062400390467425842")
+E_THIRD = ce("🥉", "6062367134535652764")
 
 
 class CustomDB:
@@ -260,7 +267,7 @@ class AdminBot:
         asyncio.create_task(self.handle_callback_data(chat_id, message_id, data))
     
     def _build_stats(self, chat_id: int) -> str:
-        today = datetime.now(timezone.utc); today_str = today.strftime("%Y-%m-%d"); today_profit = CustomDB.get(f"profit_global_{today_str}", 0)
+        today = datetime.now(IST); today_str = today.strftime("%Y-%m-%d"); today_profit = CustomDB.get(f"profit_global_{today_str}", 0)
         week_profit = sum(CustomDB.get(f"profit_global_{(today - timedelta(days=i)).strftime('%Y-%m-%d')}", 0) for i in range(7))
         top_acc_name, top_acc_profit = "None", 0
         visible_accs = self.get_visible_accounts(chat_id)
@@ -340,7 +347,7 @@ class AdminBot:
         account forecasts. It needs no sklearn/pandas/numpy and therefore keeps
         Railway's small Free-plan resource budget intact.
         """
-        today = datetime.now(timezone.utc).date()
+        today = datetime.now(IST).date()
         accounts = self.get_visible_accounts(chat_id)
         if not accounts:
             return f"{E_AI} <b>Smart Forecast Engine</b>\n\nNo accounts available for analysis."
@@ -348,7 +355,7 @@ class AdminBot:
         # Use up to 30 days of existing per-account profit history. Missing keys
         # are treated as zero only after the account existed; this avoids counting
         # days before an account was added as poor performance.
-        account_forecasts: list[tuple[str, float, float, int, str]] = []
+        account_forecasts: list[tuple[str, float, float, float, int, str]] = []
         aggregate_actual = [0.0] * 30
         total_history_days = 0
 
@@ -389,13 +396,14 @@ class AdminBot:
                 daily = [0.0] * 30
             week = sum(daily[:7])
             month = sum(daily)
-            account_forecasts.append((account.get("label", "Account"), week, month, len(values), method))
+            account_forecasts.append((account.get("label", "Account"), daily[0], week, month, len(values), method))
 
         if not account_forecasts:
             return f"{E_AI} <b>Smart Forecast Engine</b>\n━━━━━━━━━━━━━━━━━━━━━━\n{E_TIME} Not enough earning history yet.\n\nLet the accounts complete a few cycles and the model will learn from the real per-account data."
 
-        week_pred = sum(row[1] for row in account_forecasts)
-        month_pred = sum(row[2] for row in account_forecasts)
+        daily_pred = sum(row[1] for row in account_forecasts)
+        week_pred = sum(row[2] for row in account_forecasts)
+        month_pred = sum(row[3] for row in account_forecasts)
         last7 = aggregate_actual[-7:]
         prev7 = aggregate_actual[-14:-7]
         recent_rate = sum(last7) / 7.0
@@ -413,8 +421,9 @@ class AdminBot:
         # + lower rolling error. This is deliberately not presented as certainty.
         avg_history = total_history_days / max(1, len(accounts))
         confidence = "High" if avg_history >= 21 and len(account_forecasts) >= 3 else ("Medium" if avg_history >= 7 else "Low")
-        top = sorted(account_forecasts, key=lambda row: row[2], reverse=True)[:3]
-        top_lines = "\n".join(f"{E_USER} {name}: <code>{int(month):,}</code>" for name, _, month, _, _ in top)
+        top = sorted(account_forecasts, key=lambda row: row[1], reverse=True)[:3]
+        rank_icons = (E_FIRST, E_SECOND, E_THIRD)
+        top_lines = "\n".join(f"{rank_icons[i]} <b>{i + 1}st</b> {name}: <code>{int(daily):,} Extols/day</code>" if i == 0 else (f"{rank_icons[i]} <b>{i + 1}nd</b> {name}: <code>{int(daily):,} Extols/day</code>" if i == 1 else f"{rank_icons[i]} <b>{i + 1}rd</b> {name}: <code>{int(daily):,} Extols/day</code>") for i, (name, daily, _, _, _, _) in enumerate(top))
 
         return (
             f"{E_AI} <b>Adaptive Forecast Engine</b>\n"
@@ -422,10 +431,10 @@ class AdminBot:
             f"{E_USER} Accounts analysed: <code>{len(accounts)}</code>\n"
             f"{E_TIME} Recent earning rate: <code>{int(recent_rate):,} Extols/day</code>\n"
             f"{E_STATS} Momentum: {momentum}\n"
-            f"{E_NUM} Model health: <code>{confidence}</code>\n\n"
-            f"{E_NUM} 1 Week Expected: <code>{int(week_pred):,} Extols</code>\n"
-            f"{E_NUM} 1 Month Expected: <code>{int(month_pred):,} Extols</code>\n\n"
-            f"{E_PIN} <b>Top projected accounts</b>\n{top_lines}\n\n"
+            f"{E_HEALTH} Model health: <code>{confidence}</code>\n\n"
+            f"{E_MONEY} Daily earned: <code>{int(aggregate_actual[-1]):,} Extols/day</code>\n"
+            f"{E_TIME} Daily expected: <code>{int(daily_pred):,} Extols/day</code>\n\n"
+            f"{E_PIN} <b>Top daily accounts</b>\n{top_lines}\n\n"
             f"<i>Forecast is based on each account's real history and rolling backtesting; it is an estimate, not a guarantee.</i>"
         )
 
@@ -537,6 +546,7 @@ class AdminBot:
         ram_usage = self._ram_usage()
         text = (
             f"{E_SET} <b>Server Status</b>\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{E_TIME} Time (IST): <code>{datetime.now(IST).strftime("%d-%m-%Y %I:%M:%S %p")}</code>\n"
             f"{E_TIME} Uptime: <code>{h}h {m}m {s}s</code>\n"
             f"{E_AI} RAM Usage: <code>{ram_usage}</code>\n"
             f"{E_LINK} Active Tasks: <code>{len(self.active_tasks)}</code>\n"
@@ -894,7 +904,7 @@ def bottom_tiles() -> ReplyKeyboardMarkup:
             [
                 KeyboardButton(
                     "Accounts",
-                    icon_custom_emoji_id="6057728771719435723",
+                    icon_custom_emoji_id=ACCOUNT_EMOJI_ID,
                     style=_button_style("primary"),
                 ),
                 KeyboardButton(
@@ -936,7 +946,7 @@ def bottom_tiles() -> ReplyKeyboardMarkup:
 def main_keyboard() -> InlineKeyboardMarkup:
     return inline([
         [
-            button("Accounts", "accounts", "6057728771719435723", style="primary"),
+            button("Accounts", "accounts", ACCOUNT_EMOJI_ID, style="primary"),
             button("Balances", "balances", "5409048419211682843", style="success"),
         ],
         [
@@ -995,7 +1005,7 @@ def assignment_home_keyboard(accounts: list) -> InlineKeyboardMarkup:
         [
             [button("Assign Account", "assign_start", "5271604874419647061", style="primary")],
             [
-                button("Accounts", "accounts", "6057728771719435723", style="primary"),
+                button("Accounts", "accounts", ACCOUNT_EMOJI_ID, style="primary"),
                 button("Groups", "groups", "5177109606723223979", style="primary"),
             ],
             [button("Back to Main", "menu", "5416041192905265756", style="primary")],
@@ -1099,4 +1109,13 @@ def parse_single_int(args: str, usage: str) -> int:
     try: return int(args.strip())
     except ValueError: raise ValueError(f"Usage: {usage}")
 def short(value: str) -> str: return value[:8]
-def short_time(value: str | None) -> str: return value.replace("T", " ")[:16] if value else "-"
+def short_time(value: str | None) -> str:
+    if not value:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(IST).strftime("%d-%m %I:%M %p IST")
+    except Exception:
+        return str(value).replace("T", " ")[:16]
