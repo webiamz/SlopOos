@@ -21,7 +21,6 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.functions.account import ResetAuthorizationRequest
 
 from app.notifier import BotNotifier
 from app.store import Store
@@ -485,9 +484,55 @@ class AdminBot:
             elif data == "action_send_help": await self.reply(chat_id, f"{E_LINK} <b>Auto Message</b>\nSend:\n<code>/set_action send_message | Response text</code>", settings_keyboard(), message_id=message_id)
             elif data == "cycle_help": await self.reply(chat_id, f"{E_TIME} <b>Set Cycle</b>\nSend:\n<code>/set_cycle 12</code>", settings_keyboard(), message_id=message_id)
             elif data == "keywords_help": await self.reply(chat_id, f"{E_SEC} <b>Set Keywords</b>\nSend:\n<code>/set_keywords slot,booking</code>", settings_keyboard(), message_id=message_id)
+            elif data.startswith("security_logout:"):
+                await self.handle_security_action(chat_id, data, "logout")
+            elif data.startswith("security_confirm:"):
+                await self.handle_security_action(chat_id, data, "confirm")
             elif data == "help": await self.reply(chat_id, self.get_help_text(), main_keyboard(), message_id=message_id)
             else: await self.reply(chat_id, f"{E_ERR} Unknown button.", main_keyboard(), message_id=message_id)
         except Exception as exc: await self.reply(chat_id, f"{E_ERR} Error: {exc}", main_keyboard(), message_id=message_id)
+
+    async def handle_security_action(self, chat_id: int, data: str, action: str) -> None:
+        """Queue a security decision; the worker performs the real MTProto action.
+
+        The admin bot never opens a second user session and never calls
+        ResetAuthorizationRequest itself. This keeps one source of truth and
+        removes a whole class of accidental-current-session risks.
+        """
+        try:
+            prefix = "security_logout:" if action == "logout" else "security_confirm:"
+            token = data[len(prefix):].strip()
+            if not token or len(token) != 32:
+                await self.reply(chat_id, f"{E_ERR} Invalid security action.", main_keyboard())
+                return
+
+            pending = CustomDB.get(f"security_pending_token_{token}", None)
+            if not isinstance(pending, dict):
+                await self.reply(chat_id, f"{E_WARN} <b>Security alert expired.</b>\nNo session was touched.", main_keyboard())
+                return
+
+            # Queue, never execute. Worker re-validates the exact authorization
+            # against Telegram immediately before doing anything destructive.
+            queue = CustomDB.get("security_action_queue", [])
+            if isinstance(queue, dict):
+                queue = [queue]
+            if not isinstance(queue, list):
+                queue = []
+            if not any(isinstance(item, dict) and item.get("token") == token for item in queue):
+                queue.append({"token": token, "action": action, "requested_by": int(chat_id), "requested_at": int(time.time())})
+                CustomDB.set("security_action_queue", queue)
+
+            verb = "terminate" if action == "logout" else "trust"
+            await self.reply(
+                chat_id,
+                f"{E_CHK} <b>Security action queued.</b>\n"
+                f"{E_USER} Account: <code>{pending.get('account_label', 'Unknown')}</code>\n"
+                f"{E_INFO} Requested: <code>{verb}</code>\n"
+                f"{E_SEC} The worker will re-check the exact session before applying it.",
+                main_keyboard(),
+            )
+        except Exception as exc:
+            await self.reply(chat_id, f"{E_ERR} <b>Security action failed:</b> <code>{str(exc)}</code>", main_keyboard())
 
     async def shift_admin(self, chat_id: int, args: str) -> None:
         if chat_id not in self.owner_admin_ids: await self.reply(chat_id, f"{E_ERR} Access Denied"); return

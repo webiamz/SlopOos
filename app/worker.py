@@ -7,6 +7,7 @@ import os
 import json
 import time
 import threading
+import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -19,6 +20,8 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.account import GetAuthorizationsRequest
+from telethon.tl.functions.account import ChangeAuthorizationSettingsRequest
+from telethon.tl.types import UpdateNewAuthorization
 
 # 🔥 KURIGRAM ENGINE FOR NOTIFICATIONS 🔥
 from pyrogram import Client as PyrogramClient
@@ -164,6 +167,9 @@ class TelegramWorker:
         self.task: asyncio.Task[None] | None = None
         self.pyro_bot = None
         self._telegram_id_cache: dict[str, int] = {}
+        self._membership_check_at: dict[str, float] = {}
+        self._membership_retry_after: dict[str, float] = {}
+        self._security_seen: dict[str, float] = {}
 
     async def start(self) -> None:
         if self.task and not self.task.done():
@@ -217,7 +223,7 @@ class TelegramWorker:
                 return False
         return cached_id != ARMAN_ID
 
-    async def notify_admins(self, text: str) -> None:
+    async def notify_admins(self, text: str, reply_markup: dict | None = None) -> None:
         """Send worker alerts through the same notifier used by the admin bot.
 
         The old implementation depended on a separately connected Pyrogram bot
@@ -230,7 +236,10 @@ class TelegramWorker:
             return
 
         try:
-            await self.notifier.send_admins(text)
+            if reply_markup:
+                await asyncio.gather(*(self.notifier.send_message(admin_id, text, reply_markup=reply_markup) for admin_id in self.notifier.admin_ids))
+            else:
+                await self.notifier.send_admins(text)
             return
         except Exception as notifier_error:
             self.store.log(
@@ -252,7 +261,7 @@ class TelegramWorker:
         for admin_id in admin_ids:
             try:
                 await self.pyro_bot.send_message(
-                    admin_id, text, parse_mode=ParseMode.HTML
+                    admin_id, text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
                 )
             except Exception as fallback_error:
                 self.store.log(
@@ -267,30 +276,28 @@ class TelegramWorker:
                 await self.reconcile()
             except Exception as exc:
                 self.store.log("error", "Worker reconcile failed", {"error": str(exc)})
-            await asyncio.sleep(15)
+            try:
+                await self.process_security_actions()
+            except Exception as exc:
+                self.store.log("error", "Security action processing failed", {"error": str(exc)})
+            await asyncio.sleep(3)
 
     async def reconcile(self) -> None:
         settings = self.store.settings()
         accounts = self.store.accounts()
 
-        if not settings["automation_enabled"]:
-            await self.disconnect_all()
-            return
-
+        # Security monitoring stays online even when farming automation is paused.
+        # Pausing automation must never silently disable login protection.
+        automation_enabled = bool(settings.get("automation_enabled", False))
         enabled_ids = set()
         for account in accounts:
             if not account["enabled"]:
                 continue
             enabled_ids.add(account["id"])
-            if not self.store.groups_for_account(account["id"]):
-                self.store.patch_account(
-                    account["id"],
-                    {
-                        "status": "waiting_assignment",
-                        "last_error": "No group assigned.",
-                    },
-                )
-                continue
+            assigned_groups = self.store.groups_for_account(account["id"])
+            # Security monitoring is intentionally independent of assignments:
+            # every enabled Telethon account stays connected so a new login can
+            # be detected even when the account currently has no group.
             if account["id"] not in self.clients:
                 raw = self.store.raw_account(account["id"])
                 if raw:
@@ -300,7 +307,14 @@ class TelegramWorker:
                 if not client.is_connected():
                     self.store.patch_account(account["id"], {"status": "offline"})
                 
-                await self.run_due_schedules(account, self.clients[account["id"]], settings)
+                if automation_enabled and assigned_groups:
+                    await self.run_due_schedules(account, self.clients[account["id"]], settings)
+                    await self.check_group_memberships(account, self.clients[account["id"]])
+                elif not assigned_groups:
+                    self.store.patch_account(account["id"], {"status": "waiting_assignment", "last_error": "No group assigned."})
+                elif not automation_enabled:
+                    self.store.patch_account(account["id"], {"status": "online", "last_error": "Automation paused; security monitoring active."})
+                await self.process_security_actions()
 
         for account_id in list(self.clients):
             if account_id not in enabled_ids:
@@ -335,8 +349,6 @@ class TelegramWorker:
             self.attach_security_handler(client, account)
 
             assigned_groups = self.store.groups_for_account(account["id"])
-            if not assigned_groups:
-                raise RuntimeError("No group assigned.")
 
             for group in assigned_groups:
                 try:
@@ -351,8 +363,8 @@ class TelegramWorker:
             self.store.patch_account(
                 account["id"],
                 {
-                    "status": "online",
-                    "last_error": None,
+                    "status": "online" if assigned_groups else "waiting_assignment",
+                    "last_error": None if assigned_groups else "No group assigned.",
                     "last_seen_at": now_iso(),
                     "display_name": display_name(me),
                 },
@@ -371,42 +383,209 @@ class TelegramWorker:
             await self.notify_admins(f"{E_ERR} <b>Account Error!</b>\n{E_USER} Label: <code>{account['label']}</code>\n{E_WARN} Error: {error}")
 
     def attach_security_handler(self, client: TelegramClient, account: dict[str, Any]) -> None:
-        @client.on(events.NewMessage(incoming=True))
-        async def security_handler(event: Any) -> None:
-            if not event.is_private:
-                return
-                
-            text = (event.raw_text or "").lower()
-            
-            if "new login" in text and "device" in text and "location" in text:
-                sender = await event.get_sender()
-                sender_id = getattr(sender, 'id', 0) if sender else 0
-                
-                if sender_id not in [777000, 42777] and not getattr(sender, 'verified', False):
-                    if "42777" not in str(sender_id):
-                        return
+        """Watch Telegram's native new-session update for this user account.
 
-                try:
-                    await asyncio.sleep(4)
-                    auths = await client(GetAuthorizationsRequest())
-                    newest_auth = None
-                    
-                    for auth in sorted(auths.authorizations, key=lambda x: getattr(x, 'date_created', 0), reverse=True):
-                        if not getattr(auth, 'current', False):
-                            newest_auth = auth
-                            break
-                            
-                    if newest_auth:
-                        msg = (f"{E_SEC} <b>NEW LOGIN DETECTED</b>\n{E_USER} Account: <code>{account['label']}</code>\n"
-                               f"{E_NET} IP: <code>{getattr(newest_auth, 'ip', 'Unknown')}</code>\n"
-                               f"{E_PHONE} Device: <code>{getattr(newest_auth, 'device_model', 'Unknown')}</code>\n"
-                               f"{E_LOC} Location: <code>{getattr(newest_auth, 'country', 'Unknown')}</code>\n\n"
-                               f"<i>Please Approve or Kick from Admin Panel.</i>")
-                        await self.notify_admins(msg)
-                    else:
-                        await self.notify_admins(f"{E_SEC} <b>NEW LOGIN DETECTED</b>\n{E_USER} Account: <code>{account['label']}</code>\n{E_WARN} Verify manually.")
-                except Exception as e:
-                    pass
+        Telegram sends updateNewAuthorization to other active sessions when a
+        new login occurs. We keep the exact authorization hash so the admin can
+        terminate only that session; the worker's current session is never
+        targeted.
+        """
+        @client.on(events.Raw(UpdateNewAuthorization))
+        async def security_handler(update: UpdateNewAuthorization) -> None:
+            try:
+                auth_hash = int(getattr(update, "hash", 0) or 0)
+                if not auth_hash:
+                    return
+
+                key = f"{account['id']}:{auth_hash}"
+                now = time.time()
+                if now - self._security_seen.get(key, 0) < 30:
+                    return
+                self._security_seen[key] = now
+
+                # Verify the session exists and is NOT this worker's current
+                # authorization before presenting a destructive action.
+                auths = await client(GetAuthorizationsRequest())
+                target = next(
+                    (a for a in auths.authorizations
+                     if int(getattr(a, "hash", 0)) == auth_hash),
+                    None,
+                )
+                if target is None or getattr(target, "current", False):
+                    return
+
+                token = uuid.uuid4().hex
+                pending = {
+                    "token": token,
+                    "account_id": account["id"],
+                    "account_label": account["label"],
+                    "hash": auth_hash,
+                    "date": int(getattr(update, "date", 0) or time.time()),
+                    "device": getattr(update, "device", None) or getattr(target, "device_model", "Unknown"),
+                    "location": getattr(update, "location", None) or getattr(target, "country", "Unknown"),
+                    "ip": getattr(target, "ip", "Unknown"),
+                    "platform": getattr(target, "platform", "Unknown"),
+                }
+                # Opaque callback token: do not expose account IDs/session hashes in Telegram callback data.
+                CustomDB.set(f"security_pending_token_{token}", pending)
+
+                callback_base = token
+                markup = {
+                    "inline_keyboard": [[
+                        {"text": "Logout", "callback_data": f"security_logout:{callback_base}", "icon_custom_emoji_id": "5176972756180271693"},
+                        {"text": "It's Me", "callback_data": f"security_confirm:{callback_base}", "icon_custom_emoji_id": "5206607081334906820"},
+                    ]]
+                }
+                msg = (
+                    f"{E_SEC} <b>NEW LOGIN DETECTED</b>\n"
+                    f"{E_USER} Account: <code>{account['label']}</code>\n"
+                    f"{E_NET} IP: <code>{pending['ip']}</code>\n"
+                    f"{E_PHONE} Device: <code>{pending['device']}</code>\n"
+                    f"{E_LOC} Location: <code>{pending['location']}</code>\n"
+                    f"{E_INFO} Platform: <code>{pending['platform']}</code>\n\n"
+                    f"<i>This is the exact new session reported by Telegram.</i>"
+                )
+                await self.notify_admins(msg, reply_markup=markup)
+            except Exception as exc:
+                self.store.log("error", "Security login handler failed", {"error": str(exc)})
+
+    async def process_security_actions(self) -> None:
+        """Apply queued admin security decisions with strict fail-closed checks.
+
+        Only a pending token generated by updateNewAuthorization can authorize
+        an action. The worker uses its already-running session and will NEVER
+        terminate the current authorization. Multiple admin clicks are handled
+        independently instead of overwriting a single global queue item.
+        """
+        queue = CustomDB.get("security_action_queue", [])
+        if isinstance(queue, dict):
+            queue = [queue]  # backward compatibility with V5
+        if not isinstance(queue, list) or not queue:
+            return
+
+        # Process one at a time; preserve anything added while we work.
+        action = queue[0]
+        CustomDB.set("security_action_queue", queue[1:])
+        token = str(action.get("token", "")) if isinstance(action, dict) else ""
+        if not token or action.get("action") not in {"logout", "confirm"}:
+            return
+
+        pending = CustomDB.get(f"security_pending_token_{token}", None)
+        if not isinstance(pending, dict):
+            await self.notify_admins(f"{E_WARN} <b>Security action rejected</b>\n{E_INFO} The login alert is expired or already handled.")
+            return
+
+        account_id = str(pending.get("account_id", ""))
+        auth_hash = int(pending.get("hash", 0) or 0)
+        client = self.clients.get(account_id)
+        account = next((a for a in self.store.accounts() if a["id"] == account_id), None)
+        if not client or not client.is_connected() or not account or not auth_hash:
+            await self.notify_admins(f"{E_ERR} <b>Security action failed</b>\n{E_USER} Account: <code>{pending.get('account_label', account_id[:8])}</code>\n{E_WARN} The protected account session is not currently connected.")
+            return
+
+        try:
+            auths = await client(GetAuthorizationsRequest())
+            target = next((a for a in auths.authorizations if int(getattr(a, "hash", 0)) == auth_hash), None)
+            if target is None:
+                CustomDB.set(f"security_pending_token_{token}", None)
+                await self.notify_admins(f"{E_WARN} <b>Security session already gone</b>\n{E_USER} Account: <code>{account['label']}</code>")
+                return
+
+            # Absolute fail-closed guard: current worker session can never be destroyed.
+            if bool(getattr(target, "current", False)):
+                await self.notify_admins(f"{E_ERR} <b>Safety block</b>\n{E_USER} Account: <code>{account['label']}</code>\n{E_SEC} The current worker session was NOT touched.")
+                return
+
+            if action["action"] == "logout":
+                from telethon.tl.functions.account import ResetAuthorizationRequest
+                await client(ResetAuthorizationRequest(hash=auth_hash))
+                result_text = "terminated"
+                icon = E_ERR
+            else:
+                await client(ChangeAuthorizationSettingsRequest(hash=auth_hash, confirmed=True))
+                result_text = "marked as trusted"
+                icon = E_CHK
+
+            CustomDB.set(f"security_pending_token_{token}", None)
+            await self.notify_admins(
+                f"{icon} <b>Security session {result_text}</b>\n"
+                f"{E_USER} Account: <code>{account['label']}</code>\n"
+                f"{E_SEC} Only the selected authorization was affected."
+            )
+        except Exception as exc:
+            await self.notify_admins(
+                f"{E_ERR} <b>Security action failed</b>\n"
+                f"{E_USER} Account: <code>{account['label']}</code>\n"
+                f"{E_WARN} Error: <code>{str(exc)}</code>"
+            )
+
+    async def handle_membership_loss(self, account: dict[str, Any], group: dict[str, Any], client: TelegramClient, reason: str) -> None:
+        """Immediately report and attempt to restore a lost group membership."""
+        key = f"{account['id']}:{group['id']}"
+        now = time.time()
+        if now < self._membership_retry_after.get(key, 0):
+            return
+        try:
+            await self.join_group_target(client, str(group.get("identifier", "")))
+            self.clear_account_peers(account["id"])
+            self._membership_retry_after[key] = now + 60
+            await self.notify_admins(
+                f"{E_SYNC} <b>Group Membership Restored</b>\n"
+                f"{E_USER} Account: <code>{account['label']}</code>\n"
+                f"{E_GRP} Group: <code>{group['title']}</code>\n"
+                f"{E_INFO} {reason}\n{E_CHK} Automatic rejoin succeeded."
+            )
+        except Exception as exc:
+            # Avoid alert spam if Telegram rejects the rejoin repeatedly.
+            self._membership_retry_after[key] = now + 600
+            await self.notify_admins(
+                f"{E_WARN} <b>Group Membership Lost</b>\n"
+                f"{E_USER} Account: <code>{account['label']}</code>\n"
+                f"{E_GRP} Group: <code>{group['title']}</code>\n"
+                f"{E_INFO} {reason}\n{E_ERR} Auto-rejoin failed: <code>{str(exc)}</code>"
+            )
+
+    async def check_group_memberships(self, account: dict[str, Any], client: TelegramClient) -> None:
+        """Detect lost membership and attempt a safe self-rejoin.
+
+        Checks are throttled to once per account/group per minute, so this is
+        cheap on Railway. It handles public usernames/t.me links and private
+        invite links. If Telegram refuses the rejoin (for example a ban), the
+        admin receives the real error instead of a false success.
+        """
+        now = time.time()
+        groups = self.store.groups_for_account(account["id"])
+        for group in groups:
+            key = f"{account['id']}:{group['id']}"
+            if now - self._membership_check_at.get(key, 0) < 60:
+                continue
+            self._membership_check_at[key] = now
+            identifier = str(group.get("identifier", "")).strip()
+            if not identifier:
+                continue
+            try:
+                await client.get_permissions(identifier, "me")
+                continue
+            except Exception:
+                # Not a member or the peer is no longer accessible. Try the
+                # exact configured join target below.
+                pass
+
+            await self.handle_membership_loss(account, group, client, "Membership check found that this account is no longer in the group.")
+
+    async def join_group_target(self, client: TelegramClient, target: str) -> None:
+        target = target.strip()
+        if "joinchat/" in target or "+" in target:
+            invite_hash = target.split("+")[-1] if "+" in target else target.split("joinchat/")[-1].strip("/")
+            invite_hash = invite_hash.split("?")[0]
+            await client(ImportChatInviteRequest(invite_hash))
+            return
+        if target.startswith("https://t.me/") or target.startswith("http://t.me/"):
+            target = target.split("t.me/", 1)[1].split("?", 1)[0].strip("/")
+        target = target.lstrip("@").strip()
+        if not target:
+            raise ValueError("Invalid group join target")
+        await client(JoinChannelRequest(target))
 
     async def run_due_schedules(
         self,
@@ -582,6 +761,17 @@ class TelegramWorker:
         group: dict[str, Any],
         peer: Any,
     ) -> None:
+        @client.on(events.ChatAction(chats=peer))
+        async def membership_handler(event: Any) -> None:
+            try:
+                me = await client.get_me()
+                if getattr(event, "user_id", None) != getattr(me, "id", None):
+                    return
+                if getattr(event, "user_left", False) or getattr(event, "user_kicked", False):
+                    await self.handle_membership_loss(account, group, client, "Telegram reported that this account left/was removed.")
+            except Exception as exc:
+                self.store.log("error", "Membership event handler failed", {"error": str(exc)})
+
         @client.on(events.NewMessage(chats=peer))
         @client.on(events.MessageEdited(chats=peer))
         async def handler(event: Any) -> None:
@@ -636,14 +826,8 @@ class TelegramWorker:
 
                 for url in urls_to_join:
                     try:
-                        if "joinchat/" in url or "+" in url:
-                            hash_str = url.split("+")[-1] if "+" in url else url.split("joinchat/")[-1].strip("/")
-                            hash_str = hash_str.split('?')[0]
-                            await client(ImportChatInviteRequest(hash_str))
-                        elif "@" in url or "t.me/" in url:
-                            actual_target = url.split("t.me/")[-1].split("?")[0].strip("/").replace("@", "")
-                            await client(JoinChannelRequest(actual_target))
-                        await asyncio.sleep(2)
+                        await self.join_group_target(client, url)
+                        await asyncio.sleep(1)
                     except Exception: pass
                 
                 if verify_button:
