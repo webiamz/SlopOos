@@ -110,7 +110,7 @@ class CustomDB:
             cls._sync_started = True
             def syncer():
                 while True:
-                    time.sleep(10)
+                    time.sleep(2)
                     if cls._dirty:
                         try:
                             coll = cls._get_collection()
@@ -126,7 +126,7 @@ class CustomDB:
     @classmethod
     def _refresh_cache(cls):
         now = time.time()
-        if now - cls._cache_time > 60:
+        if now - cls._cache_time > 5:
             cls._cache_time = now 
             def fetcher():
                 try:
@@ -528,7 +528,7 @@ class AdminBot:
                 f"{E_CHK} <b>Security action queued.</b>\n"
                 f"{E_USER} Account: <code>{pending.get('account_label', 'Unknown')}</code>\n"
                 f"{E_INFO} Requested: <code>{verb}</code>\n"
-                f"{E_SEC} The worker will re-check the exact session before applying it.",
+                f"{E_SEC} The worker will re-check the exact Telegram authorization before applying it.",
                 main_keyboard(),
             )
         except Exception as exc:
