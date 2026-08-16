@@ -8,6 +8,7 @@ import json
 import time
 import threading
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pymongo import MongoClient
@@ -28,6 +29,7 @@ from app.store import Store, now_iso
 
 # 🔥 TUMHARI MAIN ID (100% PROTECTED FROM CASHOUT) 🔥
 ARMAN_ID = 7998217405
+IST = ZoneInfo("Asia/Kolkata")
 
 # 🔥 AESTHETIC PREMIUM EMOJIS 🔥
 # Kurigram/Pyrogram HTML parser <emoji id="..."> use karta hai, Bot-API wala <tg-emoji emoji_id="..."> NAHI
@@ -39,7 +41,8 @@ def ce(char, eid):
     return f'<emoji id="{eid}">{char}</emoji>' if PREMIUM_EMOJI_ENABLED else char
 # Premium-only notification emoji map.
 # IDs are from the News Emoji + Telemojies 2 packs supplied for this bot.
-E_USER  = ce("👤", "6057728771719435723")
+ACCOUNT_EMOJI_ID = "6057728771719435723"
+E_USER  = ce("👤", ACCOUNT_EMOJI_ID)
 E_GRP   = ce("📂", "5177109606723223979")
 E_CHK   = ce("✔️", "5206607081334906820")
 E_ERR   = ce("❌", "5176972756180271693")
@@ -429,7 +432,8 @@ class TelegramWorker:
             if target_time_str:
                 try:
                     t_hour, t_min = map(int, target_time_str.split(":"))
-                    target_time = now.replace(hour=t_hour, minute=t_min, second=0, microsecond=0)
+                    ist_now = datetime.now(IST)
+                    target_time = ist_now.replace(hour=t_hour, minute=t_min, second=0, microsecond=0)
                     if target_time <= now:
                         target_time += timedelta(days=1)
                     self.store.mark_scheduled_run(account_id, group_id, target_time.isoformat())
@@ -674,7 +678,7 @@ class TelegramWorker:
                     new_bal = current_bal + won_amount
                     CustomDB.set(f"bal_{account['id']}", new_bal)
 
-                    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    today_str = datetime.now(IST).strftime("%Y-%m-%d")
                     global_prof = CustomDB.get(f"profit_global_{today_str}", 0) + won_amount
                     CustomDB.set(f"profit_global_{today_str}", global_prof)
                     acc_prof = CustomDB.get(f"profit_{account['id']}_{today_str}", 0) + won_amount
