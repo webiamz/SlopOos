@@ -1,0 +1,1013 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import random
+import time
+import threading
+from typing import Any
+from datetime import datetime, timedelta, timezone
+from pymongo import MongoClient
+
+#  KURIGRAM (PYROGRAM) ENGINE 
+from pyrogram import Client, filters
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, BotCommand
+from pyrogram.enums import ParseMode, ButtonStyle
+
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.account import ResetAuthorizationRequest
+
+from app.notifier import BotNotifier
+from app.store import Store
+
+START_TIME = time.time()
+REFER_STATE = {}
+MESSAGE_STATE = {}
+
+#  AESTHETIC PREMIUM EMOJIS 
+# Kurigram/Pyrogram HTML parser <emoji id="..."> use karta hai, Bot-API wala <tg-emoji emoji_id="..."> NAHI
+#  AESTHETIC PREMIUM EMOJIS 
+# Kurigram/Pyrogram HTML parser <emoji id="..."> use karta hai, Bot-API wala <tg-emoji emoji_id="..."> NAHI
+# TEST karne ke liye False rakho (plain emoji dikhega, panel guaranteed chalega).
+# Ab confirm ho chuka hai ki premium emoji kaam kar raha hai, isliye True.
+PREMIUM_EMOJI_ENABLED = True
+
+def ce(char: str, eid: str) -> str:
+    return f'<emoji id="{eid}">{char}</emoji>' if PREMIUM_EMOJI_ENABLED else ""
+
+# Premium emoji map: Telemojies 2 + News Emoji packs supplied by the user.
+E_USER   = ce("\U0001F5E3\uFE0F", "5460795800101594035")
+E_GRP    = ce("\U0001F4C2", "5177109606723223979")
+E_CHK    = ce("\u2714\uFE0F", "5206607081334906820")
+E_ERR    = ce("\u274C", "5176972756180271693")
+E_MONEY  = ce("\U0001F4B5", "5409048419211682843")
+E_LINK   = ce("\U0001F517", "5271604874419647061")
+E_STATS  = ce("\U0001F4CA", "5177256464539976338")
+E_AI     = ce("\U0001F4AD", "5467538555158943525")
+E_SEC    = ce("\U0001F512", "5296369303661067030")
+E_SET    = ce("\u2699\uFE0F", "5341715473882955310")
+E_INFO   = ce("\u2139\uFE0F", "5334544901428229844")
+E_TIME   = ce("\u231B", "5175181110572745347")
+E_NUM    = ce("\U0001F9ED", "5175058145659061211")
+E_PIN    = ce("\U0001F4CC", "5397782960512444700")
+E_EYE    = ce("\U0001F440", "5210956306952758910")
+E_GAME   = ce("\U0001F3AE", "5177050177260749554")
+E_ARROW  = ce("\u27A1\uFE0F", "5416117059207572332")
+E_ONLINE = ce("\U0001F7E2", "5416081784641168838")
+E_ERROR  = ce("\U0001F534", "5411225014148014586")
+E_WAIT   = ce("\u23F3", "5175181110572745347")
+E_OFFLINE= ce("\u26D4\uFE0F", "5260293700088511294")
+E_START  = ce("\u25B6\uFE0F", "5264919878082509254")
+E_PAUSE  = ce("\u23F8", "5359543311897998264")
+E_HOME   = ce("\U0001F3E0", "5416041192905265756")
+E_ADD    = ce("\u2795", "5397916757333654639")
+E_DELETE = ce("\U0001F5D1", "5445267414562389170")
+E_WARNING= ce("\u26A0\uFE0F", "5447644880824181073")
+E_CANCEL = ce("\u274C", "5176972756180271693")
+E_SEARCH = ce("\U0001F50D", "5231012545799666522")
+E_FILE   = ce("\U0001F4C1", "5177130218271278070")
+E_CHEVRON= ce("\U0001F51D", "5415655814079723871")
+E_MOM_UP = ce("🔼", "5449683594425410231")
+E_MOM_DOWN = ce("🔽", "5447183459602669338")
+E_MOM_STABLE = ce("➡️", "5416117059207572332")
+
+
+class CustomDB:
+    MONGO_URI = os.environ.get("MONGO_URI") or os.environ.get("MONGODB_URI", "")
+    client = None
+    db = None
+    collection = None
+    _cache = {}
+    _dirty = {}
+    _cache_time = 0
+    _sync_started = False
+
+    @classmethod
+    def _get_collection(cls):
+        if not cls.MONGO_URI: return None
+        if cls.collection is None:
+            try:
+                cls.client = MongoClient(cls.MONGO_URI, serverSelectionTimeoutMS=3000)
+                cls.db = cls.client["SlotOpsDB"]
+                cls.collection = cls.db["bot_data"]
+            except Exception: pass
+        return cls.collection
+
+    @classmethod
+    def _start_sync(cls):
+        if not cls._sync_started:
+            cls._sync_started = True
+            def syncer():
+                while True:
+                    time.sleep(10)
+                    if cls._dirty:
+                        try:
+                            coll = cls._get_collection()
+                            if coll is not None:
+                                keys = list(cls._dirty.keys())
+                                for k in keys:
+                                    val = cls._dirty[k]
+                                    coll.update_one({"_id": k}, {"$set": {"value": val}}, upsert=True)
+                                    del cls._dirty[k]
+                        except Exception: pass
+            threading.Thread(target=syncer, daemon=True).start()
+
+    @classmethod
+    def _refresh_cache(cls):
+        now = time.time()
+        if now - cls._cache_time > 60:
+            cls._cache_time = now 
+            def fetcher():
+                try:
+                    coll = cls._get_collection()
+                    if coll is not None:
+                        nc = {}
+                        for doc in coll.find({}): nc[doc["_id"]] = doc.get("value")
+                        cls._cache.update(nc)
+                except Exception: pass
+            threading.Thread(target=fetcher, daemon=True).start()
+
+    @classmethod
+    def get(cls, key: str, default: Any = None) -> Any:
+        cls._refresh_cache()
+        return cls._cache.get(key, default)
+
+    @classmethod
+    def set(cls, key: str, value: Any) -> None:
+        cls._cache[key] = value
+        cls._dirty[key] = value
+        cls._start_sync()
+
+class AdminBot:
+    def __init__(self, store: Store, notifier: BotNotifier, admin_ids: list[int], api_id: int, api_hash: str) -> None:
+        self.store = store; self.notifier = notifier; self.owner_admin_ids = set(admin_ids)
+        self.api_id = api_id; self.api_hash = api_hash; self.offset = 0
+        self.task: asyncio.Task[None] | None = None; self.active_tasks: dict[int, asyncio.Task[Any]] = {}
+        self.last_error_notice: dict[str, float] = {}; self._admin_id_set: set[int] = set()
+        self._accounts_cache: list[dict[str, Any]] = []
+        self._accounts_cache_at: float = 0.0
+        self.sync_admin_ids()
+        
+        #  KURIGRAM CLIENT INITIALIZATION 
+        self.app = Client(
+            "admin_bot",
+            api_id=self.api_id,
+            api_hash=self.api_hash,
+            bot_token=self.notifier.bot_token,
+            in_memory=True
+        )
+
+    async def set_bot_menu(self):
+        try:
+            commands = [
+                BotCommand("start", "Open Admin Panel"), BotCommand("mass_refer", "Start Mass Referral task"),
+                BotCommand("claim", "Mass claim to assigned groups"), BotCommand("message", "Auto-send msg from random accounts"),
+                BotCommand("random", "Randomize slot schedules"), BotCommand("status", "Check Server RAM & Uptime"),
+                BotCommand("help", "Show commands guide")
+            ]
+            await self.app.set_bot_commands(commands)
+        except Exception: pass
+
+    def get_visible_accounts(self, chat_id: int) -> list[dict[str, Any]]:
+        # Short TTL cache keeps button presses/UI reads responsive while avoiding
+        # a database round-trip on every tap. Writes naturally refresh on the next
+        # TTL boundary, and critical mutations also invalidate this cache.
+        now = time.monotonic()
+        if now - self._accounts_cache_at > 1.5:
+            self._accounts_cache = self.store.accounts()
+            self._accounts_cache_at = now
+        all_accounts = self._accounts_cache
+        master_owner = list(self.owner_admin_ids)[0] if self.owner_admin_ids else 0
+        view_state = CustomDB.get(f"shift_{chat_id}", str(chat_id))
+        visible_accs = []
+        for acc in all_accounts:
+            acc_owner = str(CustomDB.get(f"owner_{acc['id']}", master_owner))
+            if view_state.lower() == "all" or acc_owner == str(view_state): visible_accs.append(acc)
+        return visible_accs
+
+    def get_help_text(self) -> str:
+        return f"""{E_INFO} <b>SlotOps Admin Guide</b>\n━━━━━━━━━━━━━━━━━━━━━━\n{E_GRP} <b>Add Resources:</b>\n<code>/add_account Label | SESSION</code>\n<code>/add_group Title | @link</code>\n\n{E_SET} <b>Assignments & Balance:</b>\n<code>/assign ACC GROUP [HH:MM]</code>\n<code>/set_bal ACC AMOUNT</code>\n<code>/random</code> (Scatters slot timings)\n\n{E_STATS} <b>Analytics & Security:</b>\n<code>/stats</code> (Daily & Weekly Profit)\n<code>/guess</code> (Adaptive Profit Forecast)\n<code>/status</code> (Server RAM & Uptime)\n\n{E_AI} <b>Automation & Raids:</b>\n<code>/claim /daily</code> (Send msg to assigned groups)\n<code>/mass_refer</code> | <code>/stop_ref</code>\n<code>/message</code> (Auto-send messages from random accounts)\n━━━━━━━━━━━━━━━━━━━━━━"""
+
+    async def start(self) -> None:
+        if self.task and not self.task.done(): return
+        if not self.notifier.enabled: return
+        
+        self.app.add_handler(MessageHandler(self.on_message, filters.private))
+        self.app.add_handler(CallbackQueryHandler(self.on_callback))
+        await self.app.start()
+        await self.set_bot_menu()
+        
+        async def dummy_loop():
+            while True: await asyncio.sleep(3600)
+        self.task = asyncio.create_task(dummy_loop())
+
+    async def stop(self) -> None:
+        if self.task: self.task.cancel()
+        await self.app.stop()
+
+    async def on_message(self, client, message) -> None:
+        chat_id = message.chat.id
+        text = message.text or ""
+        if not text or not self.is_admin(chat_id): return
+        asyncio.create_task(self.handle_command(chat_id, text))
+
+    async def on_callback(self, client, query) -> None:
+        chat_id = query.message.chat.id
+        message_id = query.message.id
+        data = query.data
+        if not self.is_admin(chat_id):
+            await query.answer("Unauthorized", show_alert=True)
+            return
+        await query.answer()
+        asyncio.create_task(self.handle_callback_data(chat_id, message_id, data))
+    
+    def _build_stats(self, chat_id: int) -> str:
+        today = datetime.now(timezone.utc); today_str = today.strftime("%Y-%m-%d"); today_profit = CustomDB.get(f"profit_global_{today_str}", 0)
+        week_profit = sum(CustomDB.get(f"profit_global_{(today - timedelta(days=i)).strftime('%Y-%m-%d')}", 0) for i in range(7))
+        top_acc_name, top_acc_profit = "None", 0
+        visible_accs = self.get_visible_accounts(chat_id)
+        for acc in visible_accs:
+            acc_profit = CustomDB.get(f"profit_{acc['id']}_{today_str}", 0)
+            if acc_profit > top_acc_profit: top_acc_profit = acc_profit; top_acc_name = acc["label"]
+        return f"{E_STATS} <b>Performance Analytics</b>\n━━━━━━━━━━━━━━━━━━━━━━\n{E_MONEY} Today's Profit: <code>{today_profit:,} Extols</code>\n{E_TIME} Last 7 Days: <code>{week_profit:,} Extols</code>\n{E_NUM} Top Farmer: <code>{top_acc_name}</code> ({top_acc_profit:,})\n{E_USER} Active Accounts: <code>{len(visible_accs)}</code>\n━━━━━━━━━━━━━━━━━━━━━━"
+
+    @staticmethod
+    def _forecast_method(values: list[float], method: str, horizon: int) -> list[float]:
+        if not values:
+            return [0.0] * horizon
+        clean = [max(0.0, float(v)) for v in values]
+        recent7 = clean[-7:]
+        if method == "mean":
+            level = sum(recent7) / len(recent7)
+            return [level] * horizon
+        if method == "ewma":
+            level = clean[0]
+            alpha = 0.35
+            for value in clean[1:]:
+                level = alpha * value + (1.0 - alpha) * level
+            return [max(0.0, level)] * horizon
+        # Damped trend: learns direction but deliberately decays the slope so a
+        # single abnormal day cannot explode a 30-day forecast.
+        window = clean[-14:] if len(clean) >= 14 else clean
+        n = len(window)
+        if n < 2:
+            return [sum(window) / max(1, n)] * horizon
+        x_mean = (n - 1) / 2.0
+        y_mean = sum(window) / n
+        denom = sum((i - x_mean) ** 2 for i in range(n)) or 1.0
+        slope = sum((i - x_mean) * (y - y_mean) for i, y in enumerate(window)) / denom
+        slope = max(-y_mean, min(slope, max(1.0, y_mean * 0.75)))
+        level = max(0.0, window[-1])
+        forecasts = []
+        damping = 0.82
+        for day in range(1, horizon + 1):
+            effective_slope = slope * (damping ** (day - 1))
+            value = level + effective_slope * day
+            forecasts.append(max(0.0, value))
+        # Keep the model anchored to observed scale. This prevents a short-lived
+        # spike from becoming an absurd monthly prediction.
+        robust_high = max(recent7) * 1.8 if recent7 else 0.0
+        if robust_high > 0:
+            forecasts = [min(v, robust_high) for v in forecasts]
+        return forecasts
+
+    @classmethod
+    def _select_forecast_model(cls, values: list[float]) -> tuple[str, float]:
+        """Pick the method with the lowest rolling one-day WAPE/MAE score."""
+        if len(values) < 4:
+            return "mean", 0.0
+        methods = ("mean", "ewma", "trend")
+        test_count = min(7, len(values) - 2)
+        errors: dict[str, list[float]] = {m: [] for m in methods}
+        actuals: list[float] = []
+        start = len(values) - test_count
+        for idx in range(start, len(values)):
+            history = values[:idx]
+            actual = max(0.0, float(values[idx]))
+            actuals.append(actual)
+            for method in methods:
+                pred = cls._forecast_method(history, method, 1)[0]
+                errors[method].append(abs(pred - actual))
+        denom = sum(actuals) or 1.0
+        scores = {m: sum(errs) / denom for m, errs in errors.items()}
+        best = min(methods, key=lambda m: scores[m])
+        return best, max(0.0, 1.0 - min(1.0, scores[best]))
+
+    def _build_guess(self, chat_id: int) -> str:
+        """Adaptive, account-aware forecasting without an external ML service.
+
+        The old predictor used only seven global values and invented a decaying
+        slope. This version forecasts each visible account independently, selects
+        the best of three tiny models by rolling backtesting, then aggregates the
+        account forecasts. It needs no sklearn/pandas/numpy and therefore keeps
+        Railway's small Free-plan resource budget intact.
+        """
+        today = datetime.now(timezone.utc).date()
+        accounts = self.get_visible_accounts(chat_id)
+        if not accounts:
+            return f"{E_AI} <b>Smart Forecast Engine</b>\n\nNo accounts available for analysis."
+
+        # Use up to 30 days of existing per-account profit history. Missing keys
+        # are treated as zero only after the account existed; this avoids counting
+        # days before an account was added as poor performance.
+        account_forecasts: list[tuple[str, float, float, int, str]] = []
+        aggregate_actual = [0.0] * 30
+        total_history_days = 0
+
+        for account in accounts:
+            created_raw = account.get("created_at")
+            try:
+                created = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00")).date() if created_raw else today - timedelta(days=30)
+            except Exception:
+                created = today - timedelta(days=30)
+            first_day = max(created, today - timedelta(days=29))
+            values: list[float] = []
+            for offset in range((today - first_day).days + 1):
+                day = first_day + timedelta(days=offset)
+                value = CustomDB.get(f"profit_{account['id']}_{day.strftime('%Y-%m-%d')}", 0) or 0
+                try:
+                    value = max(0.0, float(value))
+                except (TypeError, ValueError):
+                    value = 0.0
+                values.append(value)
+
+            # Add this account's observed history to the aggregate series.
+            start_offset = (first_day - (today - timedelta(days=29))).days
+            for i, value in enumerate(values):
+                pos = start_offset + i
+                if 0 <= pos < 30:
+                    aggregate_actual[pos] += value
+
+            nonzero = sum(1 for v in values if v > 0)
+            total_history_days += len(values)
+            if nonzero == 0:
+                continue
+
+            method, reliability = self._select_forecast_model(values)
+            daily = self._forecast_method(values, method, 30)
+            # Disabled accounts are still analysed, but contribute zero to future
+            # earnings because automation is currently off for them.
+            if not account.get("enabled", True):
+                daily = [0.0] * 30
+            week = sum(daily[:7])
+            month = sum(daily)
+            account_forecasts.append((account.get("label", "Account"), week, month, len(values), method))
+
+        if not account_forecasts:
+            return f"{E_AI} <b>Smart Forecast Engine</b>\n━━━━━━━━━━━━━━━━━━━━━━\n{E_TIME} Not enough earning history yet.\n\nLet the accounts complete a few cycles and the model will learn from the real per-account data."
+
+        week_pred = sum(row[1] for row in account_forecasts)
+        month_pred = sum(row[2] for row in account_forecasts)
+        last7 = aggregate_actual[-7:]
+        prev7 = aggregate_actual[-14:-7]
+        recent_rate = sum(last7) / 7.0
+        previous_rate = sum(prev7) / 7.0 if prev7 else recent_rate
+        if previous_rate <= 0 and recent_rate > 0:
+            momentum = f"{E_MOM_UP} Starting"
+        elif recent_rate > previous_rate * 1.05:
+            momentum = f"{E_MOM_UP} Growing"
+        elif recent_rate < previous_rate * 0.95:
+            momentum = f"{E_MOM_DOWN} Dropping"
+        else:
+            momentum = f"{E_MOM_STABLE} Stable"
+
+        # A transparent model-health indicator: more history + more nonzero days
+        # + lower rolling error. This is deliberately not presented as certainty.
+        avg_history = total_history_days / max(1, len(accounts))
+        confidence = "High" if avg_history >= 21 and len(account_forecasts) >= 3 else ("Medium" if avg_history >= 7 else "Low")
+        top = sorted(account_forecasts, key=lambda row: row[2], reverse=True)[:3]
+        top_lines = "\n".join(f"{E_USER} {name}: <code>{int(month):,}</code>" for name, _, month, _, _ in top)
+
+        return (
+            f"{E_AI} <b>Adaptive Forecast Engine</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{E_USER} Accounts analysed: <code>{len(accounts)}</code>\n"
+            f"{E_TIME} Recent earning rate: <code>{int(recent_rate):,} Extols/day</code>\n"
+            f"{E_STATS} Momentum: {momentum}\n"
+            f"{E_NUM} Model health: <code>{confidence}</code>\n\n"
+            f"{E_NUM} 1 Week Expected: <code>{int(week_pred):,} Extols</code>\n"
+            f"{E_NUM} 1 Month Expected: <code>{int(month_pred):,} Extols</code>\n\n"
+            f"{E_PIN} <b>Top projected accounts</b>\n{top_lines}\n\n"
+            f"<i>Forecast is based on each account's real history and rolling backtesting; it is an estimate, not a guarantee.</i>"
+        )
+
+    def _build_menu(self, chat_id: int) -> str:
+        settings = self.store.settings(); my_accs = len(self.get_visible_accounts(chat_id))
+        return f"{E_SET} <b>SlotOps Control Center</b>\n━━━━━━━━━━━━━━━━━━━━━━\n{E_SEC} <b>Status:</b> <code>{'Running' if settings['automation_enabled'] else 'Paused'}</code>\n{E_USER} <b>Accounts:</b> <code>{my_accs}</code>\n━━━━━━━━━━━━━━━━━━━━━━\n{E_GAME} <b>Select an action:</b>"
+
+    async def send_stats(self, chat_id: int, message_id: int | None = None) -> None: await self.reply(chat_id, await asyncio.to_thread(self._build_stats, chat_id), main_keyboard(), message_id=message_id)
+    async def send_guess(self, chat_id: int, message_id: int | None = None) -> None: await self.reply(chat_id, await asyncio.to_thread(self._build_guess, chat_id), main_keyboard(), message_id=message_id)
+    async def send_menu(self, chat_id: int, message_id: int | None = None) -> None: await self.reply(chat_id, await asyncio.to_thread(self._build_menu, chat_id), main_keyboard(), message_id=message_id)
+
+    async def handle_callback_data(self, chat_id: int, message_id: int, data: str) -> None:
+        try:
+            if data == "menu": await self.send_menu(chat_id, message_id=message_id)
+            elif data == "accounts": await self.reply(chat_id, await asyncio.to_thread(self.render_accounts, chat_id), accounts_keyboard(), message_id=message_id)
+            elif data == "balances": await self.reply(chat_id, await asyncio.to_thread(self.render_balances, chat_id), main_keyboard(), message_id=message_id)
+            elif data == "stats": await self.send_stats(chat_id, message_id=message_id)
+            elif data == "guess": await self.send_guess(chat_id, message_id=message_id)
+            elif data == "status": await self.server_status(chat_id, message_id=message_id)
+            elif data == "groups": await self.reply(chat_id, await asyncio.to_thread(self.render_groups), groups_keyboard(), message_id=message_id)
+            elif data == "assignments": await self.reply(chat_id, await asyncio.to_thread(self.render_assignments, chat_id), assignment_home_keyboard(self.get_visible_accounts(chat_id)), message_id=message_id)
+            elif data == "add_account_help": await self.reply(chat_id, f"{E_CHK} <b>Add Account</b>\n\nSend:\n<code>/add_account Label | SESSION</code>", back_keyboard(), message_id=message_id)
+            elif data == "delete_account_start": await self.show_delete_account_picker(chat_id, message_id=message_id)
+            elif data.startswith("delete_account_confirm:"): account = self.store.resolve_account(data.split(":", 1)[1]); await self.reply(chat_id, f"{E_ERR} <b>Delete account?</b>\n\n<code>{account['label']}</code>", delete_confirm_keyboard(account["id"]), message_id=message_id)
+            elif data.startswith("delete_account_yes:"): account = self.store.resolve_account(data.split(":", 1)[1]); self.store.delete_account(account["id"]); self._accounts_cache_at = 0.0; CustomDB.set(f"owner_{account['id']}", None); await self.reply(chat_id, f"{E_CHK} <b>Deleted:</b> <code>{account['label']}</code>", accounts_keyboard(), message_id=message_id)
+            elif data == "delete_all_accounts_confirm": await self.reply(chat_id, f"{E_ERR} <b>WARNING</b>\nDelete <b>ALL YOUR ACCOUNTS</b>?", inline([[button("Delete All", "delete_all_accounts_yes", "5445267414562389170", style="danger")], [button("Cancel", "accounts", "5176972756180271693")]]), message_id=message_id)
+            elif data == "delete_all_accounts_yes":
+                count = 0
+                for acc in self.get_visible_accounts(chat_id): self.store.delete_account(acc["id"]); count += 1
+                self._accounts_cache_at = 0.0
+                await self.reply(chat_id, f"{E_CHK} <b>{count}</b> accounts deleted.", accounts_keyboard(), message_id=message_id)
+            elif data == "add_group_help": await self.reply(chat_id, f"{E_GRP} <b>Add Group</b>\n\nSend:\n<code>/add_group Title | @link</code>", back_keyboard(), message_id=message_id)
+            elif data == "delete_group_start": await self.show_delete_group_picker(chat_id, message_id=message_id)
+            elif data.startswith("delete_group_confirm:"): group = self.store.resolve_group(data.split(":", 1)[1]); await self.reply(chat_id, f"{E_ERR} <b>Delete group?</b>\n\n<code>{group['title']}</code>", delete_group_confirm_keyboard(group["id"]), message_id=message_id)
+            elif data.startswith("delete_group_yes:"): group = self.store.resolve_group(data.split(":", 1)[1]); self.store.delete_group(group["id"]); await self.reply(chat_id, f"{E_CHK} <b>Deleted:</b> <code>{group['title']}</code>", groups_keyboard(), message_id=message_id)
+            elif data == "assign_start": await self.show_account_picker(chat_id, message_id=message_id)
+            elif data.startswith("pick_account:"): await self.show_group_picker(chat_id, data.split(":", 1)[1], message_id=message_id)
+            elif data.startswith("assign_pair:"): _, acc_id, grp_id = data.split(":", 2); await self.assign_ids(chat_id, acc_id, grp_id, message_id=message_id)
+            elif data == "start_auto": self.store.update_settings({"automation_enabled": True}); await self.reply(chat_id, f"{E_CHK} Automation started.", main_keyboard(), message_id=message_id)
+            elif data == "pause_auto": self.store.update_settings({"automation_enabled": False}); await self.reply(chat_id, f"{E_ERR} Automation paused.", main_keyboard(), message_id=message_id)
+            elif data == "settings": await self.reply(chat_id, await asyncio.to_thread(self.render_settings), settings_keyboard(), message_id=message_id)
+            elif data == "admins": await self.reply(chat_id, await asyncio.to_thread(self.render_admins, chat_id), admins_keyboard(), message_id=message_id)
+            elif data == "add_admin_help": await self.reply(chat_id, f"{E_USER} <b>Add Admin</b>\nSend:\n<code>/add_admin USER_ID</code>", admins_keyboard(), message_id=message_id)
+            elif data == "delete_admin_help": await self.reply(chat_id, f"{E_ERR} <b>Remove Admin</b>\nSend:\n<code>/del_admin USER_ID</code>", admins_keyboard(), message_id=message_id)
+            elif data == "slot_schedule_help": await self.reply(chat_id, f"{E_TIME} <b>Slot Schedule</b>\nSend:\n<code>/set_slot /slot | 12 | 8 | 12</code>", settings_keyboard(), message_id=message_id)
+            elif data == "test_send_help": await self.reply(chat_id, f"{E_LINK} <b>Test Message</b>\nSend:\n<code>/test_send ACCOUNT GROUP | test msg</code>", settings_keyboard(), message_id=message_id)
+            elif data == "action_log": self.store.update_settings({"action": "log_only"}); await self.reply(chat_id, f"{E_CHK} Action: log only.", settings_keyboard(), message_id=message_id)
+            elif data == "action_send_help": await self.reply(chat_id, f"{E_LINK} <b>Auto Message</b>\nSend:\n<code>/set_action send_message | Response text</code>", settings_keyboard(), message_id=message_id)
+            elif data == "cycle_help": await self.reply(chat_id, f"{E_TIME} <b>Set Cycle</b>\nSend:\n<code>/set_cycle 12</code>", settings_keyboard(), message_id=message_id)
+            elif data == "keywords_help": await self.reply(chat_id, f"{E_SEC} <b>Set Keywords</b>\nSend:\n<code>/set_keywords slot,booking</code>", settings_keyboard(), message_id=message_id)
+            elif data == "help": await self.reply(chat_id, self.get_help_text(), main_keyboard(), message_id=message_id)
+            else: await self.reply(chat_id, f"{E_ERR} Unknown button.", main_keyboard(), message_id=message_id)
+        except Exception as exc: await self.reply(chat_id, f"{E_ERR} Error: {exc}", main_keyboard(), message_id=message_id)
+
+    async def shift_admin(self, chat_id: int, args: str) -> None:
+        if chat_id not in self.owner_admin_ids: await self.reply(chat_id, f"{E_ERR} Access Denied"); return
+        if not args: await self.reply(chat_id, f"{E_INFO} Usage:\n<code>/shift ADMIN_ID</code>"); return
+        if args.lower() in ["reset", "me"]: CustomDB.set(f"shift_{chat_id}", str(chat_id)); await self.reply(chat_id, f"{E_CHK} Shift Reset", main_keyboard())
+        elif args.lower() == "all": CustomDB.set(f"shift_{chat_id}", "all"); await self.reply(chat_id, f"{E_USER} Master View Active", main_keyboard())
+        else: CustomDB.set(f"shift_{chat_id}", args.strip()); await self.reply(chat_id, f"{E_USER} Impersonating Admin: <code>{args}</code>", main_keyboard())
+
+    async def server_status(self, chat_id: int, message_id: int | None = None) -> None:
+        import os, time; uptime_sec = int(time.time() - START_TIME); h, rem = divmod(uptime_sec, 3600); m, s = divmod(rem, 60); ram_usage = "Unknown"
+        try:
+            free = os.popen('free -m').readlines()
+            if len(free) > 1: ram_info = free[1].split(); ram_usage = f"{int((float(ram_info[2]) / float(ram_info[1])) * 100)}% ({ram_info[2]}MB / {ram_info[1]}MB)"
+        except Exception: pass
+        text = f"{E_SET} <b>Server Status</b>\n━━━━━━━━━━━━━━━━━━━━━━\n{E_TIME} Uptime: <code>{h}h {m}m {s}s</code>\n{E_AI} RAM Usage: <code>{ram_usage}</code>\n{E_LINK} Active Tasks: <code>{len(self.active_tasks)}</code>\n{E_USER} Your Accounts: <code>{len(self.get_visible_accounts(chat_id))}</code>\n━━━━━━━━━━━━━━━━━━━━━━"
+        await self.reply(chat_id, text, main_keyboard(), message_id=message_id)
+
+    async def execute_mass_claim(self, chat_id: int, message_text: str, accounts: list) -> None:
+        try:
+            success_count = 0; random.shuffle(accounts)
+            for i, acc in enumerate(accounts):
+                if chat_id not in self.active_tasks: return
+                if i > 0: await asyncio.sleep(random.randint(5, 15))
+                try:
+                    raw = self.store.raw_account(acc["id"])
+                    if not raw: continue
+                    client = TelegramClient(StringSession(raw["session_string"]), self.api_id, self.api_hash, device_model="iPhone 15 Pro Max", system_version="iOS 17.5", app_version="10.14.1")
+                    await client.connect()
+                    if await client.is_user_authorized():
+                        for grp in self.store.groups_for_account(acc["id"]):
+                            try: await client.send_message(grp["identifier"], message_text); success_count += 1; await self.reply(chat_id, f"{E_CHK} Claim sent from: {acc['label']} {E_ARROW} {grp['title']}")
+                            except Exception: pass
+                    await client.disconnect()
+                except asyncio.CancelledError: raise
+                except Exception as e: await self.reply(chat_id, f"{E_ERR} Failed from {acc['label']}: {str(e)}")
+            if chat_id in self.active_tasks: del self.active_tasks[chat_id]
+            await self.reply(chat_id, f"{E_CHK} Claim Finished! Total Success: {success_count} messages sent.")
+        except asyncio.CancelledError: pass
+        except Exception as e: await self.reply(chat_id, f"{E_ERR} Error: {str(e)}")
+
+    async def execute_mass_message(self, chat_id: int, target: str, message_text: str, count: int) -> None:
+        try:
+            my_accounts = self.get_visible_accounts(chat_id)
+            if not my_accounts: await self.reply(chat_id, f"{E_ERR} No accounts available."); return
+            random.shuffle(my_accounts); selected_accounts = my_accounts[:count]
+            await self.reply(chat_id, f"{E_LINK} Initiating Mass Message to {target}...\n{E_USER} Total Accounts to be used: {len(selected_accounts)}")
+            success_count = 0
+            for i, acc in enumerate(selected_accounts):
+                if chat_id not in self.active_tasks: return
+                if i > 0: await asyncio.sleep(random.randint(15, 45))
+                try:
+                    raw = self.store.raw_account(acc["id"])
+                    if not raw: continue
+                    client = TelegramClient(StringSession(raw["session_string"]), self.api_id, self.api_hash, device_model="iPhone 15 Pro Max", system_version="iOS 17.5", app_version="10.14.1")
+                    await client.connect()
+                    if await client.is_user_authorized():
+                        actual_target = target
+                        if "joinchat/" in target or "+" in target:
+                            hash_str = target.split("+")[-1] if "+" in target else target.split("joinchat/")[-1].strip("/")
+                            try: await client(ImportChatInviteRequest(hash_str.split('?')[0]))
+                            except Exception: pass
+                        elif "@" in target or "t.me/" in target:
+                            actual_target = target.split("t.me/")[-1].split("?")[0].strip("/").replace("@", "")
+                            try: await client(JoinChannelRequest(actual_target))
+                            except Exception: pass
+                        await client.send_message(actual_target, message_text); success_count += 1; await self.reply(chat_id, f"{E_CHK} Message sent from: {acc['label']}")
+                    await client.disconnect()
+                except asyncio.CancelledError: raise
+                except Exception as e: await self.reply(chat_id, f"{E_ERR} Failed from {acc['label']}: {str(e)}")
+            if chat_id in self.active_tasks: del self.active_tasks[chat_id]
+            await self.reply(chat_id, f"{E_CHK} Finished! Successfully sent from {success_count}/{len(selected_accounts)} accounts.")
+        except asyncio.CancelledError: pass
+        except Exception as e: await self.reply(chat_id, f"{E_ERR} Error: {str(e)}")
+
+    async def handle_command(self, chat_id: int, text: str) -> None:
+        command, _, args = text.partition(" "); command, args = command.lower(), args.strip()
+        
+        #  HANDLE BOTTOM TILES NAVIGATION 
+        if text == "Accounts" or command == "/accounts": await self.reply(chat_id, await asyncio.to_thread(self.render_accounts, chat_id), accounts_keyboard()); return
+        elif text == "Balances" or command in ["/balances", "/bal"]: await self.reply(chat_id, await asyncio.to_thread(self.render_balances, chat_id), main_keyboard()); return
+        elif text == "Stats" or command == "/stats": await self.send_stats(chat_id); return
+        elif text == "Settings" or command == "/settings": await self.reply(chat_id, await asyncio.to_thread(self.render_settings), settings_keyboard()); return
+        elif text == "Assignments" or command == "/assignments": await self.reply(chat_id, await asyncio.to_thread(self.render_assignments, chat_id), assignment_home_keyboard(self.get_visible_accounts(chat_id))); return
+        elif text == "Help" or command == "/help": await self.reply(chat_id, self.get_help_text(), main_keyboard()); return
+
+        try:
+            if chat_id in MESSAGE_STATE:
+                state = MESSAGE_STATE[chat_id]
+                if text == "/cancel": del MESSAGE_STATE[chat_id]; await self.reply(chat_id, f"{E_ERR} Cancelled.", main_keyboard()); return
+                if state["step"] == "waiting_target": state["target"] = text.strip(); state["step"] = "waiting_message"; await self.reply(chat_id, f"{E_CHK} Target set: {state['target']}\n\n{E_LINK} Step 2: What message do you want to send?"); return
+                elif state["step"] == "waiting_message": state["message"] = text.strip(); state["step"] = "waiting_count"; await self.reply(chat_id, f"{E_CHK} Message saved.\n\n{E_USER} Step 3: How many accounts should send this message? (Enter a number or 'all')"); return
+                elif state["step"] == "waiting_count":
+                    count_str = text.strip().lower(); total_visible = len(self.get_visible_accounts(chat_id))
+                    if count_str == 'all': count = total_visible
+                    else:
+                        try: count = int(count_str); count = min(count, total_visible)
+                        except ValueError: await self.reply(chat_id, f"{E_ERR} Enter a valid number, 'all', or /cancel"); return
+                    target = state["target"]; msg_text = state["message"]; del MESSAGE_STATE[chat_id]
+                    await self.reply(chat_id, f"{E_CHK} Setup Complete! Launching mass message task to {count} accounts...")
+                    self.active_tasks[chat_id] = asyncio.create_task(self.execute_mass_message(chat_id, target, msg_text, count))
+                    return
+
+            if command in {"/start", "/admin"}:
+                await self.app.send_message(chat_id, f"{E_CHK} <b>System Ready</b>", reply_markup=bottom_tiles(), parse_mode=ParseMode.HTML)
+                await self.send_menu(chat_id)
+            
+            elif command == "/message": MESSAGE_STATE[chat_id] = {"step": "waiting_target"}; await self.reply(chat_id, f"{E_LINK} Step 1: Send the target Username or Group Link (e.g., @username or https://t.me/...)")
+            elif command == "/claim":
+                if not args: await self.reply(chat_id, f"{E_ERR} Usage: <code>/claim MESSAGE</code>\nExample: <code>/claim /daily</code>", main_keyboard()); return
+                my_accounts = self.get_visible_accounts(chat_id)
+                if not my_accounts: await self.reply(chat_id, f"{E_ERR} No accounts available to claim."); return
+                await self.reply(chat_id, f"{E_LINK} Initiating Mass Claim...\nSending <code>{args}</code> to assigned groups for {len(my_accounts)} accounts.")
+                self.active_tasks[chat_id] = asyncio.create_task(self.execute_mass_claim(chat_id, args, my_accounts))
+            elif command == "/cancel":
+                if chat_id in REFER_STATE: del REFER_STATE[chat_id]
+                if chat_id in MESSAGE_STATE: del MESSAGE_STATE[chat_id]
+                if chat_id in self.active_tasks: self.active_tasks[chat_id].cancel(); del self.active_tasks[chat_id]
+                await self.reply(chat_id, f"{E_ERR} Cancelled.", main_keyboard())
+            elif command == "/status": await self.server_status(chat_id)
+            elif command == "/shift": await self.shift_admin(chat_id, args)
+            elif command == "/groups": await self.reply(chat_id, await asyncio.to_thread(self.render_groups), groups_keyboard())
+            elif command == "/guess": await self.send_guess(chat_id)
+            elif command == "/random":
+                visible = self.get_visible_accounts(chat_id); settings = self.store.settings(); cycle = int(settings.get("slot_interval_hours", 12)); count = 0
+                for acc in visible:
+                    for grp in self.store.groups_for_account(acc["id"]):
+                        self.store.mark_scheduled_run(acc["id"], grp["id"], (datetime.now(timezone.utc) + timedelta(seconds=random.randint(10, cycle * 3600))).isoformat()); count += 1
+                await self.reply(chat_id, f"{E_CHK} <b>Schedules Randomized!</b>\n{count} tasks scattered randomly.", main_keyboard())
+            elif command == "/set_bal":
+                acc_str, amount_str = split_tokens(args, "ACC_ID/LABEL AMOUNT"); visible = self.get_visible_accounts(chat_id)
+                found_acc = next((a for a in visible if a["label"].lower() == acc_str.lower()), None) or next((a for a in visible if a["id"].lower().startswith(acc_str.lower())), None)
+                if not found_acc: raise ValueError("Account not found.")
+                bal = int(amount_str.replace(",", "").strip()); CustomDB.set(f"bal_{found_acc['id']}", bal)
+                await self.reply(chat_id, f"{E_CHK} Balance updated for <code>{found_acc['label']}</code>: {bal} Extols", main_keyboard())
+            elif command == "/set_balance_group":
+                target = args.strip()
+                if not target: raise ValueError("Usage: /set_balance_group @GroupLink")
+                CustomDB.set("balance_group_target", target); await self.reply(chat_id, f"{E_CHK} Balance forwarding group set to: <b>{target}</b>", main_keyboard())
+            elif command == "/add_account":
+                label, session = split_pair(args, "Label | TELETHON_SESSION"); account = self.store.add_account(label, session)
+                CustomDB.set(f"owner_{account['id']}", chat_id); await self.reply(chat_id, f"{E_CHK} <b>Account added.</b>\nID: <code>{short(account['id'])}</code>\nLabel: <code>{account['label']}</code>", assignment_home_keyboard(self.get_visible_accounts(chat_id)))
+            elif command == "/add_group":
+                title, identifier = split_pair(args, "Title | @link"); group = self.store.add_group(title, identifier)
+                await self.reply(chat_id, f"{E_CHK} <b>Group added.</b>\nID: <code>{short(group['id'])}</code>", assignment_home_keyboard(self.get_visible_accounts(chat_id)))
+            elif command == "/assign":
+                parts = args.split()
+                if len(parts) not in [2, 3]: raise ValueError("Usage: /assign ACC GROUP [HH:MM]")
+                visible = self.get_visible_accounts(chat_id)
+                acc = next((a for a in visible if a["label"].lower() == parts[0].lower()), None) or next((a for a in visible if a["id"].lower().startswith(parts[0].lower())), None)
+                grps = self.store.groups()
+                grp = next((g for g in grps if g["title"].lower() == parts[1].lower() or str(g.get("identifier","")).lower() == parts[1].lower()), None) or next((g for g in grps if g["id"].lower().startswith(parts[1].lower())), None)
+                if not acc or not grp: raise ValueError("Account or Group not found.")
+                for old_g in self.store.groups_for_account(acc["id"]): self.store.unassign_group(acc["id"], old_g["id"])
+                self.store.assign_group(acc["id"], grp["id"]); CustomDB.set(f"target_{acc['id']}_{grp['id']}", parts[2] if len(parts) == 3 else None)
+                await self.reply(chat_id, f"{E_CHK} Assigned <code>{acc['label']}</code> {E_ARROW} <code>{grp['title']}</code>", main_keyboard())
+            elif command == "/set_time":
+                parts = args.split(); visible = self.get_visible_accounts(chat_id)
+                acc = next((a for a in visible if a["label"].lower() == parts[0].lower()), None) or next((a for a in visible if a["id"].lower().startswith(parts[0].lower())), None)
+                grps = self.store.groups()
+                grp = next((g for g in grps if g["title"].lower() == parts[1].lower() or str(g.get("identifier","")).lower() == parts[1].lower()), None) or next((g for g in grps if g["id"].lower().startswith(parts[1].lower())), None)
+                if acc and grp: CustomDB.set(f"target_{acc['id']}_{grp['id']}", parts[2]); await self.reply(chat_id, f"{E_CHK} Target Time set", main_keyboard())
+            elif command == "/unassign":
+                acc_tok, grp_tok = split_tokens(args, "/unassign ACC GROUP"); visible = self.get_visible_accounts(chat_id)
+                acc = next((a for a in visible if a["label"].lower() == acc_tok.lower()), None) or next((a for a in visible if a["id"].lower().startswith(acc_tok.lower())), None)
+                grps = self.store.groups()
+                grp = next((g for g in grps if g["title"].lower() == grp_tok.lower() or str(g.get("identifier","")).lower() == grp_tok.lower()), None) or next((g for g in grps if g["id"].lower().startswith(grp_tok.lower())), None)
+                if acc and grp: self.store.unassign_group(acc["id"], grp["id"]); await self.reply(chat_id, f"{E_ERR} Removed.", main_keyboard())
+            elif command == "/start_auto": self.store.update_settings({"automation_enabled": True}); await self.reply(chat_id, f"{E_CHK} Started.", main_keyboard())
+            elif command == "/pause_auto": self.store.update_settings({"automation_enabled": False}); await self.reply(chat_id, f"{E_ERR} Paused.", main_keyboard())
+            elif command == "/set_cycle": self.store.update_settings({"cycle_hours": int(args)}); await self.reply(chat_id, f"{E_CHK} Updated.", settings_keyboard())
+            elif command == "/set_keywords": self.store.update_settings({"keywords": args}); await self.reply(chat_id, f"{E_CHK} Updated.", settings_keyboard())
+            elif command == "/set_action": self.store.update_settings({"action": args.split("|")[0].strip(), "response_message": args.partition("|")[2].strip()}); await self.reply(chat_id, f"{E_CHK} Action updated.", settings_keyboard())
+            elif command == "/set_slot":
+                parts = [p.strip() for p in args.split("|")]
+                self.store.update_settings({"slot_command": parts[0], "slot_repeat_count": int(parts[1]), "slot_delay_seconds": parts[2], "slot_interval_hours": int(parts[3])})
+                await self.reply(chat_id, f"{E_CHK} Schedule updated.", settings_keyboard())
+            elif command == "/test_send":
+                acc_str, right = split_pair(args, "ACC GRP | msg"); a, g = split_tokens(acc_str, "ACC GRP")
+                await self.send_group_message(self.store.raw_account(self.store.resolve_account(a)["id"]), self.store.resolve_group(g), right)
+                await self.reply(chat_id, f"{E_CHK} Sent.", main_keyboard())
+            elif command == "/limit": CustomDB.set("limit", int(args.strip())); await self.reply(chat_id, f"{E_CHK} Limit updated.", settings_keyboard())
+            elif command == "/add_admin": self.store.add_admin_id(parse_single_int(args, "/add_admin ID")); self.sync_admin_ids(); await self.reply(chat_id, f"{E_CHK} Added.", admins_keyboard())
+            elif command in {"/del_admin", "/delete_admin"}: 
+                admin_id = parse_single_int(args, "ID")
+                if admin_id in self.owner_admin_ids: raise ValueError("Cannot remove owner.")
+                self.store.delete_admin_id(admin_id); self.sync_admin_ids(); await self.reply(chat_id, f"{E_ERR} Removed.", admins_keyboard())
+            else: 
+                pass # Ignore unknown text
+        except Exception as exc: await self.reply(chat_id, f"{E_ERR} Error: {exc}", main_keyboard())
+
+    async def send_group_message(self, account: dict, group: dict, message: str) -> None:
+        client = TelegramClient(StringSession(account["session_string"]), self.api_id, self.api_hash, device_model="iPhone 15 Pro Max", system_version="iOS 17.5", app_version="10.14.1")
+        await client.connect()
+        try:
+            if not await client.is_user_authorized(): raise RuntimeError("Not authorized.")
+            await client.send_message(group["identifier"], message)
+        finally: await client.disconnect()
+
+    async def show_account_picker(self, chat_id: int, message_id: int | None = None) -> None:
+        accounts = self.get_visible_accounts(chat_id)
+        if not accounts: await self.reply(chat_id, f"{E_ERR} No accounts.", accounts_keyboard(), message_id=message_id); return
+        rows, row = [], []
+        for a in accounts[:100]:
+            row.append(button(a["label"], f"pick_account:{short(a['id'])}")); 
+            if len(row) == 2: rows.append(row); row = []
+        if row: rows.append(row)
+        rows.append([button("Back", "menu", "5416117059207572332")])
+        await self.reply(chat_id, "Select account:", inline(rows), message_id=message_id)
+
+    async def show_delete_account_picker(self, chat_id: int, message_id: int | None = None) -> None:
+        accounts = self.get_visible_accounts(chat_id)
+        if not accounts: await self.reply(chat_id, f"{E_ERR} No accounts.", accounts_keyboard(), message_id=message_id); return
+        rows, row = [], []
+        for a in accounts[:100]:
+            row.append(button(a["label"], f"delete_account_confirm:{short(a["id"])}", "5445267414562389170", style="danger"))
+            if len(row) == 2: rows.append(row); row = []
+        if row: rows.append(row)
+        rows.append([button("Cancel", "accounts", "5176972756180271693"), button("Back to Main", "menu", "5416041192905265756")])
+        await self.reply(chat_id, "Select account to delete:", inline(rows), message_id=message_id)
+
+    async def show_delete_group_picker(self, chat_id: int, message_id: int | None = None) -> None:
+        groups = self.store.groups()
+        if not groups: await self.reply(chat_id, f"{E_ERR} No groups.", groups_keyboard(), message_id=message_id); return
+        rows, row = [], []
+        for g in groups[:100]:
+            row.append(button(g["title"], f"delete_group_confirm:{short(g["id"])}", "5445267414562389170", style="danger"))
+            if len(row) == 2: rows.append(row); row = []
+        if row: rows.append(row)
+        rows.append([button("Cancel", "groups", "5176972756180271693"), button("Back to Main", "menu", "5416041192905265756")])
+        await self.reply(chat_id, "Select group to delete:", inline(rows), message_id=message_id)
+
+    async def show_group_picker(self, chat_id: int, account_id: str, message_id: int | None = None) -> None:
+        groups = self.store.groups()
+        if not groups: await self.reply(chat_id, f"{E_ERR} No groups.", groups_keyboard(), message_id=message_id); return
+        rows, row = [], []
+        for g in groups[:100]:
+            row.append(button(g["title"], f"assign_pair:{short(account_id)}:{short(g['id'])}"))
+            if len(row) == 2: rows.append(row); row = []
+        if row: rows.append(row)
+        rows.append([button("Back", "assign_start", "5416117059207572332")])
+        await self.reply(chat_id, "Select group:", inline(rows), message_id=message_id)
+
+    async def assign_ids(self, chat_id: int, account_id: str, group_id: str, message_id: int | None = None) -> None:
+        for old_g in self.store.groups_for_account(account_id): self.store.unassign_group(account_id, old_g["id"])
+        self.store.assign_group(account_id, group_id)
+        await self.reply(chat_id, f"{E_CHK} Assigned successfully.", main_keyboard(), message_id=message_id)
+
+    def render_accounts(self, chat_id: int) -> str:
+        accounts = self.get_visible_accounts(chat_id)
+        if not accounts: return f"{E_ERR} No accounts in your panel."
+        all_assignments = self.store.assignments()
+        all_scheduled = list(self.store.scheduled_runs.find({})) if hasattr(self.store, 'scheduled_runs') else []
+        sched_map = {f"{r['account_id']}_{r['group_id']}": r for r in all_scheduled}
+        lines = [f"{E_USER} <b>Accounts List:</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
+        for a in accounts:
+            acc_assignments = [asn for asn in all_assignments if asn['account_id'] == a['id']]
+            runs = []
+            for asn in acc_assignments:
+                s_run = sched_map.get(f"{a['id']}_{asn['group_id']}")
+                if s_run: runs.append(f"{asn['group_title']} (next {short_time(s_run.get('next_run_at'))})")
+            lines.append(f"{E_ONLINE if a['enabled'] else E_ERROR} <code>{short(a['id'])}</code> | <b>{a['label']}</b> (<i>{a.get('display_name', 'No Name')}</i>)\n   {E_TIME} <i>{'; '.join(runs) if runs else 'No cycle yet'}</i>\n")
+        return "\n".join(lines)
+
+    def render_balances(self, chat_id: int) -> str:
+        accounts = self.get_visible_accounts(chat_id)
+        if not accounts: return f"{E_ERR} No accounts."
+        total = 0; lines = [f"{E_MONEY} <b>Live Extols Balance</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
+        for a in accounts:
+            bal = CustomDB.get(f"bal_{a['id']}", 0); total += bal
+            status = a.get("status", "offline")
+            icon = E_ONLINE if status == "online" else E_ERROR if status == "error" else E_WAIT if status == "connecting" else E_OFFLINE
+            lines.append(f"{icon} <code>{a['label']}</code> (<i>{a.get('display_name', 'No Name')}</i>): <b>{bal:,}</b> Extols")
+        lines.append(f"━━━━━━━━━━━━━━━━━━━━━━\n{E_STATS} Total: {total:,} Extols")
+        return "\n".join(lines)
+
+    def render_groups(self) -> str:
+        groups = self.store.groups()
+        if not groups: return f"{E_ERR} No groups."
+        lines = [f"{E_GRP} <b>Groups List:</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
+        for g in groups: lines.append(f"{E_PIN} <code>{short(g['id'])}</code> | <b>{g['title']}</b>")
+        return "\n".join(lines)
+
+    def render_assignments(self, chat_id: int) -> str:
+        my_acc_ids = [a["id"] for a in self.get_visible_accounts(chat_id)]
+        try:
+            raw_assigns = list(self.store.account_groups.find({}))
+            all_groups = {g['id']: g for g in self.store.groups()}; accounts_map = {a['id']: a for a in self.store.accounts()}
+            lines = [f"{E_LINK} <b>Assignments:</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
+            for r in raw_assigns:
+                if r['account_id'] in my_acc_ids:
+                    lines.append(f"{E_USER} <code>{accounts_map.get(r['account_id'], {}).get('label', 'Unknown')}</code> {E_ARROW} {E_GRP} <b>{all_groups.get(r['group_id'], {}).get('title', 'Unknown')}</b> [{CustomDB.get(f'target_{r['account_id']}_{r['group_id']}', 'Jitter')}]")
+        except Exception:
+            assignments = self.store.assignments()
+            lines = [f"{E_LINK} <b>Assignments:</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
+            for i in assignments:
+                if i['account_id'] in my_acc_ids:
+                    lines.append(f"{E_USER} <code>{i['account_label']}</code> {E_ARROW} {E_GRP} <b>{i['group_title']}</b> [{CustomDB.get(f'target_{i['account_id']}_{i['group_id']}', 'Jitter')}]")
+        return "\n".join(lines) if len(lines) > 1 else f"{E_ERR} No assignments for your accounts."
+
+    def render_settings(self) -> str: return f"{E_SET} <b>Settings Panel</b>\n━━━━━━━━━━━━━━━━━━━━━━\n{E_TIME} Cycle: <code>{self.store.settings()['cycle_hours']}h</code>\n{E_MONEY} Limit: <code>{CustomDB.get('limit', 500)}</code>"
+    def render_admins(self, chat_id: int) -> str:
+        lines = [f"{E_USER} <b>Admins List:</b>\n━━━━━━━━━━━━━━━━━━━━━━"]
+        for a in self.effective_admin_ids(): lines.append(f"{E_USER} <code>{a}</code> | <i>{'Owner' if a in self.owner_admin_ids else 'Admin'}</i>")
+        shift_state = CustomDB.get(f"shift_{chat_id}", str(chat_id))
+        lines.append(f"━━━━━━━━━━━━━━━━━━━━━━\n{E_EYE} Current View: <code>{shift_state}</code>")
+        return "\n".join(lines)
+
+    def effective_admin_ids(self) -> list[int]:
+        return sorted(self.owner_admin_ids | set(self.store.admin_ids()))
+
+    def sync_admin_ids(self) -> None:
+        ids = self.effective_admin_ids()
+        self._admin_id_set = set(ids)
+        self.notifier.admin_ids = ids
+
+    def is_admin(self, chat_id: int) -> bool:
+        return chat_id in self._admin_id_set
+
+    async def reply(self, chat_id: int, text: str, markup: dict | None = None, message_id: int | None = None) -> None:
+        try:
+            if message_id: await self.app.edit_message_text(chat_id, message_id, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+            else: await self.app.send_message(chat_id, text, reply_markup=markup, parse_mode=ParseMode.HTML)
+        except Exception as exc:
+            self.store.log("error", "Failed to reply", {"error": str(exc)})
+            # Fallback: silent fail na ho, user ko exact error dikhe (HTML-escaped taaki fallback khud crash na kare)
+            safe_err = str(exc).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            try:
+                await self.app.send_message(chat_id, f"{E_WARNING} <b>Panel error:</b> {safe_err}")
+            except Exception:
+                pass
+
+    async def answer_callback(self, query_id: str, text: str | None = None) -> None:
+        pass # Handled correctly by Pyrogram now
+
+#  COLORED TELEGRAM BUTTONS (KURIGRAM) 
+# IMPORTANT:
+# Use Kurigram/Pyrogram high-level keyboard classes here.
+# Passing raw MTProto KeyboardButton objects directly to send_message()
+# is wrong because Pyrogram expects high-level button objects and awaits
+# their write() methods. Direct raw objects caused:
+#   "object bytes can't be used in 'await' expression"
+#
+# Kurigram exposes native Telegram button styles through ButtonStyle:
+# PRIMARY = blue, SUCCESS = green, DANGER = red.
+
+def _button_style(kind: str = "primary"):
+    kind = (kind or "primary").lower()
+    return {
+        "primary": ButtonStyle.PRIMARY,
+        "success": ButtonStyle.SUCCESS,
+        "danger": ButtonStyle.DANGER,
+    }.get(kind, ButtonStyle.DEFAULT)
+
+
+def bottom_tiles() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [
+                KeyboardButton(
+                    "Accounts",
+                    icon_custom_emoji_id="5460795800101594035",
+                    style=_button_style("primary"),
+                ),
+                KeyboardButton(
+                    "Balances",
+                    icon_custom_emoji_id="5409048419211682843",
+                    style=_button_style("success"),
+                ),
+            ],
+            [
+                KeyboardButton(
+                    "Stats",
+                    icon_custom_emoji_id="5177256464539976338",
+                    style=_button_style("primary"),
+                ),
+                KeyboardButton(
+                    "Settings",
+                    icon_custom_emoji_id="5341715473882955310",
+                    style=_button_style("primary"),
+                ),
+            ],
+            [
+                KeyboardButton(
+                    "Assignments",
+                    icon_custom_emoji_id="5271604874419647061",
+                    style=_button_style("primary"),
+                ),
+                KeyboardButton(
+                    "Help",
+                    icon_custom_emoji_id="5334544901428229844",
+                    style=_button_style("primary"),
+                ),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def main_keyboard() -> InlineKeyboardMarkup:
+    return inline([
+        [
+            button("Accounts", "accounts", "5460795800101594035", style="primary"),
+            button("Balances", "balances", "5409048419211682843", style="success"),
+        ],
+        [
+            button("Stats", "stats", "5177256464539976338", style="primary"),
+            button("AI Guess", "guess", "5467538555158943525", style="primary"),
+            button("Status", "status", "5282843764451195532", style="primary"),
+        ],
+        [
+            button("Assign Account", "assign_start", "5271604874419647061", style="primary"),
+            button("Assignments", "assignments", "5177109606723223979", style="primary"),
+        ],
+        [
+            button("Start Auto", "start_auto", "5264919878082509254", style="success"),
+            button("Pause Auto", "pause_auto", "5359543311897998264", style="danger"),
+        ],
+        [
+            button("Settings", "settings", "5341715473882955310", style="primary"),
+            button("Admins", "admins", "5460795800101594035", style="primary"),
+        ],
+        [
+            button("Help & Guide", "help", "5334544901428229844", style="primary"),
+        ],
+    ])
+
+
+def accounts_keyboard() -> InlineKeyboardMarkup:
+    return inline([
+        [
+            button("Add Account", "add_account_help", "5397916757333654639", style="success"),
+            button("Delete Account", "delete_account_start", "5445267414562389170", style="danger"),
+        ],
+        [
+            button("Delete ALL My Accounts", "delete_all_accounts_confirm", "5447644880824181073", style="danger"),
+        ],
+        [
+            button("Assign Account", "assign_start", "5271604874419647061", style="primary"),
+            button("Back to Main", "menu", "5416041192905265756", style="primary"),
+        ],
+    ])
+
+
+def groups_keyboard() -> InlineKeyboardMarkup:
+    return inline([
+        [
+            button("Add Group", "add_group_help", "5397916757333654639", style="success"),
+            button("Delete Group", "delete_group_start", "5445267414562389170", style="danger"),
+        ],
+        [
+            button("Back to Main", "menu", "5416041192905265756", style="primary"),
+        ],
+    ])
+
+
+def assignment_home_keyboard(accounts: list) -> InlineKeyboardMarkup:
+    return inline(
+        [
+            [button("Assign Account", "assign_start", "5271604874419647061", style="primary")],
+            [
+                button("Accounts", "accounts", "5460795800101594035", style="primary"),
+                button("Groups", "groups", "5177109606723223979", style="primary"),
+            ],
+            [button("Back to Main", "menu", "5416041192905265756", style="primary")],
+        ]
+        if accounts
+        else [
+            [button("Add Account", "add_account_help", "5397916757333654639", style="success")],
+            [button("Back to Main", "menu", "5416041192905265756", style="primary")],
+        ]
+    )
+
+
+def settings_keyboard() -> InlineKeyboardMarkup:
+    return inline([
+        [
+            button("Log Only", "action_log", "5395444784611480792", style="primary"),
+            button("Auto Msg", "action_send_help", "5424818078833715060", style="primary"),
+        ],
+        [
+            button("Cycle", "cycle_help", "5375338737028841420", style="primary"),
+            button("Limit", "limit_help", "5233326571099534068", style="primary"),
+        ],
+        [
+            button("Back to Main", "menu", "5416041192905265756", style="primary"),
+        ],
+    ])
+
+
+def admins_keyboard() -> InlineKeyboardMarkup:
+    return inline([
+        [
+            button("Add Admin", "add_admin_help", "5397916757333654639", style="success"),
+            button("Remove Admin", "delete_admin_help", "5445267414562389170", style="danger"),
+        ],
+        [
+            button("Back to Main", "menu", "5416041192905265756", style="primary"),
+        ],
+    ])
+
+
+def back_keyboard() -> InlineKeyboardMarkup:
+    return inline([[button("Back", "menu", "5416117059207572332", style="primary")]])
+
+
+def delete_confirm_keyboard(account_id: str) -> InlineKeyboardMarkup:
+    return inline([
+        [button("Yes, Delete", f"delete_account_yes:{short(account_id)}", "5445267414562389170", style="danger")],
+        [button("Cancel", "accounts", "5176972756180271693", style="primary")],
+    ])
+
+
+def delete_group_confirm_keyboard(group_id: str) -> InlineKeyboardMarkup:
+    return inline([
+        [button("Yes, Delete", f"delete_group_yes:{short(group_id)}", "5445267414562389170", style="danger")],
+        [button("Cancel", "groups", "5176972756180271693", style="primary")],
+    ])
+
+
+def inline(rows: list) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    btn["text"],
+                    callback_data=btn["callback_data"],
+                    icon_custom_emoji_id=btn.get("icon_custom_emoji_id"),
+                    style=_button_style(btn.get("style", "primary")),
+                )
+                for btn in row
+            ]
+            for row in rows
+        ]
+    )
+
+
+def button(
+    text: str,
+    callback_data: str,
+    icon_emoji_id: str | None = None,
+    style: str = "primary",
+) -> dict:
+    b = {
+        "text": text,
+        "callback_data": callback_data,
+        "style": style,
+    }
+    if icon_emoji_id:
+        b["icon_custom_emoji_id"] = icon_emoji_id
+    return b
+
+
+def split_pair(args: str, usage: str) -> tuple:
+    left, sep, right = args.partition("|")
+    if not sep or not left.strip() or not right.strip(): raise ValueError(f"Usage: {usage}")
+    return left.strip(), right.strip()
+def split_tokens(args: str, usage: str) -> tuple:
+    parts = args.split();
+    if len(parts) != 2: raise ValueError(f"Usage: {usage}")
+    return parts[0], parts[1]
+def parse_single_int(args: str, usage: str) -> int:
+    try: return int(args.strip())
+    except ValueError: raise ValueError(f"Usage: {usage}")
+def short(value: str) -> str: return value[:8]
+def short_time(value: str | None) -> str: return value.replace("T", " ")[:16] if value else "-"
