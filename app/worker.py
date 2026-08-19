@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pymongo import MongoClient
 
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, UserNotParticipantError, UserAlreadyParticipantError
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
@@ -223,6 +223,28 @@ class TelegramWorker:
                 # resolved, do not perform an automatic /give.
                 return False
         return cached_id != ARMAN_ID
+
+    async def notify_account_owner(self, account: dict[str, Any], text: str, reply_markup: dict | None = None) -> None:
+        """Send an account-specific alert only to the admin who added it."""
+        if not self.notifier or not self.notifier.enabled:
+            return
+        owner = CustomDB.get(f"owner_{account['id']}", None)
+        try:
+            owner_id = int(owner) if owner is not None else 0
+        except (TypeError, ValueError):
+            owner_id = 0
+        if not owner_id:
+            self.store.log("warning", "Account owner missing; alert not broadcast", {"account_id": str(account.get("id"))})
+            return
+        try:
+            await self.notifier.send_message(owner_id, text, reply_markup=reply_markup)
+        except Exception as exc:
+            self.store.log("error", "Account owner notification failed", {"account_id": str(account.get("id")), "owner_id": owner_id, "error": str(exc)})
+            if self.pyro_bot:
+                try:
+                    await self.pyro_bot.send_message(owner_id, text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+                except Exception as fallback_error:
+                    self.store.log("error", "Account owner fallback notification failed", {"account_id": str(account.get("id")), "owner_id": owner_id, "error": str(fallback_error)})
 
     async def notify_admins(self, text: str, reply_markup: dict | None = None) -> None:
         """Send worker alerts through the same notifier used by the admin bot.
@@ -644,7 +666,7 @@ class TelegramWorker:
             )
 
     async def handle_membership_loss(self, account: dict[str, Any], group: dict[str, Any], client: TelegramClient, reason: str) -> None:
-        """Immediately report and attempt to restore a lost group membership."""
+        """Restore a confirmed membership loss and notify only its owner."""
         key = f"{account['id']}:{group['id']}"
         now = time.time()
         if now < self._membership_retry_after.get(key, 0):
@@ -653,29 +675,21 @@ class TelegramWorker:
             await self.join_group_target(client, str(group.get("identifier", "")))
             self.clear_account_peers(account["id"])
             self._membership_retry_after[key] = now + 60
-            await self.notify_admins(
-                f"{E_SYNC} <b>Group Membership Restored</b>\n"
-                f"{E_USER} Account: <code>{account['label']}</code>\n"
-                f"{E_GRP} Group: <code>{group['title']}</code>\n"
-                f"{E_INFO} {reason}\n{E_CHK} Automatic rejoin succeeded."
-            )
+            await self.notify_account_owner(account, f"{E_SYNC} <b>Group Membership Restored</b>\n{E_USER} Account: <code>{account['label']}</code>\n{E_GRP} Group: <code>{group['title']}</code>\n{E_INFO} {reason}\n{E_CHK} Automatic rejoin succeeded.")
+        except UserAlreadyParticipantError:
+            # Already joined is a successful/no-op outcome, never an error alert.
+            self.clear_account_peers(account["id"])
+            self._membership_retry_after[key] = now + 60
+            return
         except Exception as exc:
-            # Avoid alert spam if Telegram rejects the rejoin repeatedly.
             self._membership_retry_after[key] = now + 600
-            await self.notify_admins(
-                f"{E_WARN} <b>Group Membership Lost</b>\n"
-                f"{E_USER} Account: <code>{account['label']}</code>\n"
-                f"{E_GRP} Group: <code>{group['title']}</code>\n"
-                f"{E_INFO} {reason}\n{E_ERR} Auto-rejoin failed: <code>{str(exc)}</code>"
-            )
+            await self.notify_account_owner(account, f"{E_WARN} <b>Group Membership Lost</b>\n{E_USER} Account: <code>{account['label']}</code>\n{E_GRP} Group: <code>{group['title']}</code>\n{E_INFO} {reason}\n{E_ERR} Auto-rejoin failed: <code>{str(exc)}</code>")
 
     async def check_group_memberships(self, account: dict[str, Any], client: TelegramClient) -> None:
-        """Detect lost membership and attempt a safe self-rejoin.
+        """Treat membership as lost only on an explicit UserNotParticipantError.
 
-        Checks are throttled to once per account/group per minute, so this is
-        cheap on Railway. It handles public usernames/t.me links and private
-        invite links. If Telegram refuses the rejoin (for example a ban), the
-        admin receives the real error instead of a false success.
+        Any entity-resolution/network/permission error is inconclusive and is
+        skipped. This prevents false rejoin attempts and notification spam.
         """
         now = time.time()
         groups = self.store.groups_for_account(account["id"])
@@ -688,14 +702,12 @@ class TelegramWorker:
             if not identifier:
                 continue
             try:
-                await client.get_permissions(identifier, "me")
-                continue
-            except Exception:
-                # Not a member or the peer is no longer accessible. Try the
-                # exact configured join target below.
-                pass
-
-            await self.handle_membership_loss(account, group, client, "Membership check found that this account is no longer in the group.")
+                entity = await client.get_entity(identifier)
+                await client.get_permissions(entity, "me")
+            except UserNotParticipantError:
+                await self.handle_membership_loss(account, group, client, "Telegram confirmed that this account is no longer a participant.")
+            except Exception as exc:
+                self.store.log("warning", "Membership check inconclusive; no rejoin attempted", {"account_id": str(account["id"]), "group_id": str(group["id"]), "identifier": identifier, "error": str(exc)})
 
     async def join_group_target(self, client: TelegramClient, target: str) -> None:
         target = target.strip()
